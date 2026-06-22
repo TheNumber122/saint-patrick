@@ -1,0 +1,26 @@
+{
+  "name": "telegram-bot-farm",
+  "version": "1.0.0",
+  "description": "Distributed Telegram automation for Patrick Stars Robot",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "login": "node login.js"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "automation",
+    "distributed"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "input": "^1.0.1",
+    "telegram": "^2.26.22"
+  }
+}
