@@ -337,3 +337,17 @@ GRANT USAGE  ON SEQUENCE balances_id_seq TO service_role;
 --   (random() * 1440)::INTEGER * INTERVAL '1 minute'
 -- )
 -- WHERE next_leave_time IS NULL;
+
+
+
+  create table if not exists protected_channels (
+    channel_id text primary key,   -- bare Telegram channel id (GramJS entity.id), as text
+    phone text,                    -- telegap account that created it
+    title text,
+    created_at timestamptz not null default now()
+  );
+
+  alter table protected_channels enable row level security;
+  grant all privileges on table protected_channels to service_role;
+  create policy "Allow full access to protected_channels"
+    on protected_channels for all using (true) with check (true);

@@ -489,12 +489,28 @@ async function leaveChannels(client, userId) {
     return 0;
   }
 
+  // Fetch telegap-protected channel ids. Fail-closed: if we can't verify the
+  // protected list, leave nothing so we never lose a telegap channel.
+  let protectedIds = new Set();
+  try {
+    const { data, error } = await supabase
+      .from("protected_channels")
+      .select("channel_id");
+    if (error) throw error;
+    protectedIds = new Set((data || []).map((r) => String(r.channel_id)));
+    console.log(`[LEAVE] ${protectedIds.size} protected channel(s) loaded`);
+  } catch (e) {
+    console.log(`[LEAVE] protected fetch failed: ${e.message}`);
+    return 0; // fail-closed: don't leave anything if we can't verify
+  }
+
   const channels = dialogs.filter(
     (d) =>
       d.entity?.className === "Channel" &&
       d.entity?.broadcast === true &&
       d.entity?.megagroup !== true &&
-      d.entity?.username !== "Aliorithm",
+      d.entity?.username !== "Aliorithm" &&
+      !protectedIds.has(String(d.entity.id)),
   );
   console.log(`[LEAVE] ${channels.length} broadcast channel(s)`);
 
@@ -1089,12 +1105,31 @@ async function doDaily(client, userId) {
   return true;
 }
 
+// Detect a promo reply that demands channel-subscriptions / task-completion
+// before it will activate. Per configuration these accounts are SKIPPED
+// (recorded terminally, never retried) instead of doing the tasks — the
+// limited promo activations are better spent on accounts that can claim
+// immediately. This is checked AFTER success/already/exhausted, so only an
+// otherwise-unrecognized "do this first" reply trips it.
+function isPromoGated(text) {
+  if (!text) return false;
+  const t = text.toLowerCase();
+  return (
+    t.includes("подпишись") ||        // "subscribe to ..."
+    t.includes("подписаться") ||      // "subscribe"
+    t.includes("вступи в") ||         // "join the channel ..."
+    t.includes("выполни задани") ||   // "complete the task(s)"
+    t.includes("выполни хотя бы") ||  // "complete at least ..."
+    t.includes("выполни всего")       // "complete in total ..."
+  );
+}
+
 // ============================================
 // PROMO
 // Mirrors doDaily steps 1-4 exactly, then clicks
 // Промокод, sends the code as a text message,
 // and reads the bot's reply.
-// Returns: 'success' | 'already_used' | 'exhausted' | 'failed'
+// Returns: 'success' | 'already_used' | 'exhausted' | 'gated' | 'failed'
 // ============================================
 async function doPromo(client, userId, code) {
   console.log(`[PROMO] Starting — code: "${code}"`);
@@ -1107,8 +1142,9 @@ async function doPromo(client, userId, code) {
     }
 
     const result = await _doPromoAttempt(client, userId, code);
-    // Permanent skip statuses — no point retrying
-    if (["SPONSOR_UNRESOLVABLE", "MENU_NOT_FOUND", "PROFILE_NOT_FOUND", "PROMO_BTN_NOT_FOUND"].includes(result)) return result;
+    // Permanent skip statuses — no point retrying. "gated" = promo demanded
+    // tasks/channel-subs, which we deliberately do NOT do (skip fast).
+    if (["SPONSOR_UNRESOLVABLE", "MENU_NOT_FOUND", "PROFILE_NOT_FOUND", "PROMO_BTN_NOT_FOUND", "gated"].includes(result)) return result;
     if (result !== "MENU_RESPONSE" || attempt === 1) return result;
     console.log(`[PROMO] Got menu response — will retry`);
   }
@@ -1165,6 +1201,13 @@ async function _doPromoAttempt(client, userId, code) {
   const btnPopup = await getCallbackAnswer(client, profile, promoBtn.data);
   console.log(`[PROMO] Btn popup: ${btnPopup || "none"}`);
 
+  // Gate can appear right on the promo button (e.g. "subscribe first") —
+  // skip fast before even sending the code.
+  if (isPromoGated(btnPopup)) {
+    console.log(`[PROMO] Gated at button (tasks/channels required) — skipping account`);
+    return "gated";
+  }
+
   // Captcha may appear after promo button click
   await sleep(1200);
   await solveCaptcha(client);
@@ -1201,6 +1244,14 @@ async function _doPromoAttempt(client, userId, code) {
   if (text.includes("уже активировал"))    return "already_used";
   if (text.includes("недействителен") || text.includes("закончились использования"))
     return "exhausted";
+
+  // Promo requires joining channels / completing tasks first. We skip these
+  // (terminal) instead of doing the tasks, so the limited activations go to
+  // accounts that can claim immediately.
+  if (isPromoGated(text)) {
+    console.log("[PROMO] Gated (tasks/channels required) — skipping account");
+    return "gated";
+  }
 
   // Bot responded with main menu — promo button didn't register
   if (text.includes("Получи свою личную ссылку")) return "MENU_RESPONSE";
@@ -1282,7 +1333,7 @@ async function processPendingPromos() {
     // "failed" is treated as TRANSIENT (flood wait, network, slow bot, captcha
     // miss) — NOT recorded, so the account retries on the next sweep instead of
     // silently losing the promo forever.
-    const TERMINAL = ["success", "already_used", "exhausted"];
+    const TERMINAL = ["success", "already_used", "exhausted", "gated"];
 
     async function processPromoAccount(acc, idx = 0) {
       if (exhaustedFlag) return;
@@ -1316,6 +1367,7 @@ async function processPendingPromos() {
         if (status === "success") { console.log(`[PROMO] ✅ ${acc.phone}`); successCount++; }
         else if (status === "already_used") console.log(`[PROMO] 🚫 ${acc.phone} — already used`);
         else if (status === "exhausted") console.log(`[PROMO] ❌ ${acc.phone} — code exhausted`);
+        else if (status === "gated") console.log(`[PROMO] ⏭️  ${acc.phone} — gated (tasks/channels required), skipping`);
         else console.log(`[PROMO] ⚠️  ${acc.phone} — ${status}`);
       } catch (e) {
         const flood = /FLOOD/i.test(e.message || "");
