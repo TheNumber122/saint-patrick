@@ -4,6 +4,9 @@
   "description": "Distributed Telegram automation for Patrick Stars Robot",
   "main": "index.js",
   "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node index.js",
     "login": "node login.js"

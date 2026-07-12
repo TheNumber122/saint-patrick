@@ -351,3 +351,73 @@ GRANT USAGE  ON SEQUENCE balances_id_seq TO service_role;
   grant all privileges on table protected_channels to service_role;
   create policy "Allow full access to protected_channels"
     on protected_channels for all using (true) with check (true);
+
+
+-- ============================================================
+-- 9. PROMO SYSTEM
+--
+-- promo/monitor.js watches the source channel and INSERTs codes
+-- into promo_codes. Each worker instance (index.js) redeems them
+-- across its accounts and logs one row per attempt in
+-- promo_redemptions. monitor_state persists the watcher cursor.
+--
+-- Constraints the application RELIES ON:
+--   · promo_codes.code UNIQUE          → dedups detection (error 23505 = skip)
+--   · UNIQUE(promo_code_id, user_id)   → idempotent redemption record;
+--                                         blocks re-attempting the same code
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS promo_codes (
+  id              BIGSERIAL PRIMARY KEY,
+  code            TEXT NOT NULL UNIQUE,          -- the promo code string
+  raw_message     TEXT,                          -- first 500 chars of source msg
+  stars_amount    INTEGER,                       -- parsed "на N ⭐" (nullable)
+  max_activations INTEGER,                       -- parsed "N активаций" (nullable)
+  is_active       BOOLEAN NOT NULL DEFAULT true, -- flipped false once exhausted
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Workers query WHERE is_active — partial index keeps that fast.
+CREATE INDEX IF NOT EXISTS idx_promo_codes_active ON promo_codes(is_active) WHERE is_active = true;
+
+COMMENT ON TABLE promo_codes IS
+  'Promo codes detected by promo/monitor.js. is_active=false once redemptions are exhausted.';
+
+
+CREATE TABLE IF NOT EXISTS promo_redemptions (
+  id            BIGSERIAL PRIMARY KEY,
+  promo_code_id BIGINT NOT NULL REFERENCES promo_codes(id) ON DELETE CASCADE,
+  user_id       BIGINT NOT NULL,
+  instance_id   INTEGER,
+  status        TEXT,          -- success | already_used | exhausted | gated
+  result_text   TEXT,          -- first 200 chars of bot reply / error
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  -- One terminal record per (code, account). Makes the insert idempotent and
+  -- stops an account from re-attempting a code it already resolved.
+  UNIQUE (promo_code_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_promo_redemptions_code ON promo_redemptions(promo_code_id);
+CREATE INDEX IF NOT EXISTS idx_promo_redemptions_user ON promo_redemptions(user_id);
+
+COMMENT ON TABLE promo_redemptions IS
+  'One row per account-per-code redemption attempt. Only TERMINAL statuses are recorded; transient "failed" is intentionally left unrecorded so it retries next sweep.';
+
+
+CREATE TABLE IF NOT EXISTS monitor_state (
+  key        TEXT PRIMARY KEY,              -- e.g. 'last_seen_msg_id'
+  value      JSONB,                         -- e.g. {"msg_id": 12345}
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+COMMENT ON TABLE monitor_state IS
+  'Key/value cursor store for promo/monitor.js (last_seen_msg_id lives here).';
+
+
+-- Grants — monitor.js uses the ANON key; index.js uses ANON key too.
+-- Mirror the permissive access the rest of this schema grants.
+GRANT ALL PRIVILEGES ON TABLE promo_codes        TO anon, authenticated, service_role;
+GRANT ALL PRIVILEGES ON TABLE promo_redemptions  TO anon, authenticated, service_role;
+GRANT ALL PRIVILEGES ON TABLE monitor_state      TO anon, authenticated, service_role;
+GRANT USAGE, SELECT ON SEQUENCE promo_codes_id_seq       TO anon, authenticated, service_role;
+GRANT USAGE, SELECT ON SEQUENCE promo_redemptions_id_seq TO anon, authenticated, service_role;

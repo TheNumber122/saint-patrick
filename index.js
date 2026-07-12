@@ -21,6 +21,16 @@ const PORT = process.env.PORT || 10000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const jitter = () => 4000 + Math.random() * 2000;
 
+// Session-safety guard: /promo and /trigger now run independently, so the SAME
+// session_string must never be connected by both paths at once (that triggers
+// AUTH_KEY_DUPLICATED and loses the account). Any code path that connects a
+// session claims its user_id here first and releases it in finally.
+const activeSessions = new Set();
+
+// In-flight counter for the promo rolling pool — surfaced in logs so we can
+// confirm real concurrency in production.
+let promoInFlight = 0;
+
 // Race a promise against a timeout so a hung GramJS connect/op can never
 // stall a whole batch (gramjs #691 — connect() can hang indefinitely).
 function withTimeout(promise, ms, label) {
@@ -1343,7 +1353,16 @@ async function processPendingPromos() {
       if (idx > 0) await sleep(idx * 400);
       if (exhaustedFlag) return;
 
-      console.log(`\n[PROMO] ━━━ ${acc.phone} ━━━`);
+      // Session-safety: never let /trigger and /promo connect the same session
+      // concurrently. If it's already in flight elsewhere, skip this run.
+      if (activeSessions.has(acc.user_id)) {
+        console.log(`[PROMO] ⏭️  ${acc.phone} — session already in flight, skipping`);
+        return;
+      }
+      activeSessions.add(acc.user_id);
+      promoInFlight++;
+      console.log(`[PROMO] ━━━ ${acc.phone} ━━━ (in-flight: ${promoInFlight})`);
+
       let client;
       let status = "failed";
       let resultText = "";
@@ -1378,6 +1397,8 @@ async function processPendingPromos() {
         if (client) {
           try { await sleep(200); await client.destroy(); } catch (_) {}
         }
+        activeSessions.delete(acc.user_id);
+        promoInFlight--;
       }
 
       // Mark processed regardless so the same session is never re-touched later
@@ -1408,25 +1429,42 @@ async function processPendingPromos() {
         });
     }
 
-    // Process accounts in concurrent batches
-    for (let i = 0; i < pending.length; i += PROMO_CONCURRENCY) {
-      if (exhaustedFlag) break;
+    // Rolling pool: keep up to PROMO_CONCURRENCY accounts in flight at all
+    // times, refilling as each finishes — no barrier, so fast accounts never
+    // wait on slow ones. Promos die in ~1–2 min, so every stalled slot is lost
+    // activations. is_active is re-checked periodically as slots are filled.
+    let cursor = 0;
+    let sinceActiveCheck = 0;
 
-      // Re-check is_active before each batch
-      const { data: stillActive } = await supabase
-        .from("promo_codes")
-        .select("is_active")
-        .eq("id", promo.id)
-        .single();
+    async function runNext() {
+      while (true) {
+        if (exhaustedFlag) return;
+        const i = cursor++;
+        if (i >= pending.length) return;
 
-      if (!stillActive?.is_active) {
-        console.log("[PROMO] ⛔ Code exhausted by another instance — stopping");
-        break;
+        // Periodically re-check is_active (roughly once per pool-worth of starts)
+        // so we stop fast once another instance exhausts the code.
+        if (++sinceActiveCheck >= PROMO_CONCURRENCY) {
+          sinceActiveCheck = 0;
+          const { data: stillActive } = await supabase
+            .from("promo_codes")
+            .select("is_active")
+            .eq("id", promo.id)
+            .single();
+          if (!stillActive?.is_active) {
+            console.log("[PROMO] ⛔ Code exhausted by another instance — stopping");
+            exhaustedFlag = true;
+            return;
+          }
+        }
+
+        // Ramp the first pool-fill so we don't connect all 15 in lockstep.
+        await processPromoAccount(pending[i], i < PROMO_CONCURRENCY ? i : 0);
       }
-
-      const batch = pending.slice(i, i + PROMO_CONCURRENCY);
-      await Promise.allSettled(batch.map((acc, idx) => processPromoAccount(acc, idx)));
     }
+
+    const poolSize = Math.min(PROMO_CONCURRENCY, pending.length);
+    await Promise.allSettled(Array.from({ length: poolSize }, () => runNext()));
 
     // Mark exhausted in DB after batch completes
     if (exhaustedFlag) {
@@ -1450,6 +1488,14 @@ async function processPendingPromos() {
 // ============================================
 async function processAccount(acc) {
   console.log(`\n━━━ Account ${acc.phone} ━━━`);
+
+  // Session-safety: skip if a promo push is already using this session.
+  if (activeSessions.has(acc.user_id)) {
+    console.log(`⏭️ ${acc.phone} — session in flight (promo), skipping this sweep`);
+    return;
+  }
+  activeSessions.add(acc.user_id);
+
   let client;
 
   try {
@@ -1589,6 +1635,7 @@ async function processAccount(acc) {
         console.log("🔌 Disconnected");
       } catch (_) {}
     }
+    activeSessions.delete(acc.user_id);
   }
 }
 
@@ -1600,8 +1647,10 @@ async function runTrigger() {
     `\n${"=".repeat(40)}\n🚀 Instance ${INSTANCE_ID} - ${new Date().toLocaleString()}\n${"=".repeat(40)}`,
   );
 
-  // 1. Process pending promo codes (same per-account pattern as daily)
-  const promoProcessed = await processPendingPromos();
+  // 1. Process pending promo codes (same per-account pattern as daily).
+  // Goes through the shared guard so a concurrent /promo push can't launch a
+  // second overlapping pool (which would double the real concurrency).
+  const promoProcessed = (await runPromoSweep()) || new Set();
 
   // 2. Normal trigger — filter out accounts already processed for promos
   const accounts = await getAccountsDue();
@@ -1612,6 +1661,25 @@ async function runTrigger() {
     await sleep(1000 + Math.random() * 2000);
   }
   console.log("\n✅ Done\n");
+}
+
+// Single owner of the promo-sweep guard. BOTH /trigger and the /promo push call
+// this, so only ONE promo sweep can run at a time on this instance — otherwise
+// two overlapping pools would each spin up PROMO_CONCURRENCY clients (2× the
+// intended concurrency against the same bot). Returns the processed Set, or
+// null if a sweep was already in flight and this call was skipped.
+let promoRunning = false;
+async function runPromoSweep() {
+  if (promoRunning) {
+    console.log("⏳ Promo sweep already running — skipping this request");
+    return null;
+  }
+  promoRunning = true;
+  try {
+    return await processPendingPromos();
+  } finally {
+    promoRunning = false;
+  }
 }
 
 const app = express();
@@ -1637,6 +1705,19 @@ app.get("/trigger", (req, res) => {
       triggerRunning = false;
     });
 });
+
+// Promo fast-path — pushed by monitor.js on every new code. Runs ONLY the
+// promo sweep (via the shared runPromoSweep guard, so it can't overlap a promo
+// sweep already running inside /trigger), so redemption starts in seconds
+// instead of waiting up to 5 min for the next UptimeRobot ping.
+app.get("/promo", (req, res) => {
+  res.send("Promo triggered");
+  console.log(`\n🎟️  Promo push received — ${new Date().toLocaleString()}`);
+  runPromoSweep().catch((e) =>
+    console.error(`[PROMO] Fast-path error: ${e.message}`),
+  );
+});
+
 app.listen(PORT, () =>
   console.log(`\n🌐 Port ${PORT} | Instance ${INSTANCE_ID}\n`),
 );
