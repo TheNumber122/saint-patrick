@@ -1135,6 +1135,31 @@ function isPromoGated(text) {
 }
 
 // ============================================
+// WAIT FOR BOT REPLY — adaptive poll
+// Returns as soon as a NEW inbound text (id beyond `sinceId`) arrives, up to
+// `capMs`. A fixed sleep is simultaneously too short under a promo rush (bot
+// lags → we falsely give up and mark the account "failed") and too slow when
+// the bot is idle (we burn the full wait before looking). Polling fixes both.
+// Per-account clients run with receiveUpdates:false, so update-based event
+// handlers never fire on these connections — polling is the only option here.
+// Anchoring on `sinceId` (the id of the message we just sent) prevents a fast
+// poll from returning a stale pre-existing message.
+// ============================================
+async function waitForBotReply(client, sinceId, { capMs = 9000, stepMs = 350 } = {}) {
+  const deadline = Date.now() + capMs;
+  let msgs = [];
+  while (Date.now() < deadline) {
+    msgs = await client.getMessages(BOT, { limit: 5 });
+    const reply = msgs.find(
+      (m) => !m.out && m.text && (!sinceId || m.id > sinceId),
+    );
+    if (reply) return { reply, msgs };
+    await sleep(stepMs);
+  }
+  return { reply: null, msgs };
+}
+
+// ============================================
 // PROMO
 // Mirrors doDaily steps 1-4 exactly, then clicks
 // Промокод, sends the code as a text message,
@@ -1224,27 +1249,22 @@ async function _doPromoAttempt(client, userId, code) {
 
   // Step 4: Send the code
   await sleep(800 + Math.random() * 400);
-  await client.sendMessage(BOT, { message: code });
+  const sent = await client.sendMessage(BOT, { message: code });
   console.log(`[PROMO] Sent: "${code}"`);
 
-  // Step 5: Wait for bot reply
-  await sleep(1500);
-  let resMsgs = await client.getMessages(BOT, { limit: 5 });
-  let botMsg = resMsgs.find((m) => !m.out && m.text);
-  if (!botMsg) {
-    await sleep(1500);
-    resMsgs = await client.getMessages(BOT, { limit: 5 });
-    botMsg = resMsgs.find((m) => !m.out && m.text);
-  }
+  // Step 5: Wait for bot reply — adaptive poll, returns the instant a reply
+  // newer than our sent message lands. Fast when the bot is idle, patient (up
+  // to the cap) when a rush slows it so we don't falsely mark wins as "failed".
+  let { reply: botMsg, msgs: resMsgs } = await waitForBotReply(client, sent?.id);
 
   // Handle captcha that appeared after code send
   const captchaHere = (resMsgs || []).find((m) => m.text?.includes("ПРОВЕРКА НА РОБОТА"));
   if (captchaHere) {
     console.log(`[PROMO] Captcha after code send — solving...`);
     await solveCaptcha(client);
-    await sleep(1500);
-    resMsgs = await client.getMessages(BOT, { limit: 5 });
-    botMsg = resMsgs.find((m) => !m.out && m.text && !m.text.includes("ПРОВЕРКА НА РОБОТА"));
+    // Wait for the real result that lands after the captcha message (adaptive).
+    ({ reply: botMsg, msgs: resMsgs } = await waitForBotReply(client, captchaHere.id));
+    if (botMsg?.text?.includes("ПРОВЕРКА НА РОБОТА")) botMsg = null;
   }
 
   const text = botMsg?.text || "";

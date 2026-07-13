@@ -421,3 +421,19 @@ GRANT ALL PRIVILEGES ON TABLE promo_redemptions  TO anon, authenticated, service
 GRANT ALL PRIVILEGES ON TABLE monitor_state      TO anon, authenticated, service_role;
 GRANT USAGE, SELECT ON SEQUENCE promo_codes_id_seq       TO anon, authenticated, service_role;
 GRANT USAGE, SELECT ON SEQUENCE promo_redemptions_id_seq TO anon, authenticated, service_role;
+
+ALTER TABLE promo_codes
+  ADD COLUMN IF NOT EXISTS message_at    TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS source        TEXT,
+  ADD COLUMN IF NOT EXISTS pushed_count  INTEGER,
+  ADD COLUMN IF NOT EXISTS push_ok_count INTEGER;
+
+CREATE TABLE IF NOT EXISTS monitor_heartbeat (
+  ts               TIMESTAMPTZ PRIMARY KEY DEFAULT NOW(),
+  connected        BOOLEAN,
+  channel_ok       BOOLEAN,
+  last_seen_msg_id BIGINT
+);
+CREATE INDEX IF NOT EXISTS idx_monitor_heartbeat_ts ON monitor_heartbeat(ts DESC);
+
+GRANT ALL ON monitor_heartbeat TO anon, authenticated, service_role;

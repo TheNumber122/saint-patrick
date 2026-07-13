@@ -5,6 +5,10 @@ Up to **12 instances** run in parallel, each owning a slice of accounts, coordin
 through a shared **Supabase (Postgres)** database. All race-sensitive writes are pushed
 into atomic SQL functions so instances never corrupt each other's state.
 
+> **Maintenance note:** this file is the canonical mental model of the system. When you
+> change control flow (routes, guards, the promo pool, detection), update the matching
+> section here. Sections tagged **⟳ updated** reflect the promo-fast-path work.
+
 ---
 
 ## 0. The three processes at a glance
@@ -21,25 +25,33 @@ into atomic SQL functions so instances never corrupt each other's state.
 └───────▲───────────────────────▲──────────────────────────────▲────────────────┘
         │                        │                              │
         │ insert account         │ read/write account state     │ insert promo_codes
-        │ (one-time, manual)     │ (every trigger)              │ (real-time watcher)
+        │ (one-time, manual)     │ (every trigger + promo push)  │ (real-time watcher)
         │                        │                              │
 ┌───────┴────────┐   ┌───────────┴─────────────┐   ┌────────────┴───────────────┐
-│   login.js     │   │   index.js  (×12)       │   │   promo/monitor.js  (×1)   │
+│   login.js     │   │   index.js  (×N, ≤12)   │   │   promo/monitor.js  (×1)   │
 │  (CLI, manual) │   │   THE WORKER            │   │   THE PROMO DETECTOR        │
 │                │   │   PORT 10000            │   │   PORT 10001                │
 │ phone → code   │   │                         │   │                             │
 │ → session_str  │   │ GET /        liveness   │   │ GET /       cron 1min→poll  │
 │ → INSERT       │   │ GET /trigger sweep      │   │ GET /health UptimeRobot 5min│
+│                │   │ GET /promo   fast-path ◀─┼───┤ push on new code (HTTP)     │
 └────────────────┘   └─────────────────────────┘   └─────────────────────────────┘
         one account          the farm loop              watches @patrickstarsfarm
         onboarding           (clicker/daily/promo)      channel for promo codes
 ```
 
+The monitor now **pushes** to each worker's `/promo` endpoint the instant it detects a code
+(promos expire in ~1–2 min, so waiting for the 5-min sweep loses most of them). The two
+processes are otherwise decoupled — they share only the database.
+
 | Process | Count | Role | Trigger cadence |
 |---|---|---|---|
 | `login.js` | manual | Onboards ONE account: phone auth → session string → `INSERT accounts` | Run by hand |
-| `index.js` | 1 per instance (up to 12) | The worker: clicker, daily, promo redemption, channel-leave | UptimeRobot → `GET /trigger` every 5 min |
-| `promo/monitor.js` | 1 (global) | Detects new promo codes in the source channel, writes to `promo_codes` | Real-time event + `GET /` cron 1 min + 30 s interval |
+| `index.js` | 1 per instance (≤12) | Worker: clicker, daily, promo redemption, channel-leave | UptimeRobot → `GET /trigger` 5 min **+** monitor push → `GET /promo` |
+| `promo/monitor.js` | 1 (global) | Detects promo codes, writes `promo_codes`, **pushes workers** | Real-time event + `GET /` cron 1 min + 30 s interval |
+
+**Deployment:** each of these is its own process/node. The monitor is a **separate Render
+service** with Root Directory `promo/` (own `package.json`). See §8.
 
 ---
 
@@ -88,35 +100,55 @@ Uses the **service-role key** (bypasses RLS) — the only process that does.
 
 ## 2. `index.js` — THE WORKER (the heart of the system)
 
-### 2.1 HTTP surface & the re-entrancy guard
+### 2.1 HTTP surface & the two guards  ⟳ updated
 
 ```
-GET /          → "Instance N ✅"                    (liveness only)
+GET /          → "Instance N ✅"                     (liveness only)
 
-GET /trigger   → if (triggerRunning) return "Already running"   ← GUARD
+GET /trigger   → if (triggerRunning) return "Already running"      ← TRIGGER GUARD
                  triggerRunning = true
-                 res.send("Triggered")               ← responds INSTANTLY
-                 runTrigger()                         ← runs in background
-                    .finally(() => triggerRunning = false)
+                 res.send("Triggered")                ← responds INSTANTLY
+                 runTrigger().finally(() => triggerRunning = false)
+
+GET /promo     → res.send("Promo triggered")          ← responds INSTANTLY
+                 runPromoSweep()                       ← promo-only, no full sweep
+                 (no auth — same trust model as /trigger)
 ```
 
-**Why the guard matters:** UptimeRobot pings `/trigger` every 5 min, but a full sweep
-(especially promo, with 15 concurrent clients) takes much longer. Without the guard,
-two overlapping runs could connect the **same `session_string` concurrently** →
-Telegram invalidates the auth key (`AUTH_KEY_DUPLICATED`) → **account permanently lost.**
+There are **two independent flags** for two different concerns:
 
-### 2.2 `runTrigger()` — the top-level sweep order
+- **`triggerRunning`** — one full sweep (`runTrigger`) at a time. UptimeRobot pings `/trigger`
+  every 5 min but a sweep takes longer; overlapping full sweeps must not run.
+- **`promoRunning`** — owned by `runPromoSweep()` and shared by **both** entry points
+  (`/trigger`'s promo phase *and* the `/promo` push). This guarantees only ONE promo sweep
+  runs at a time, so two sources can't each spin up `PROMO_CONCURRENCY` clients and double
+  the real concurrency against the bot.
+
+```
+runPromoSweep():                    ← the single owner of promoRunning
+  if promoRunning → log + return null   (skip; a sweep is already in flight)
+  promoRunning = true
+  try   return await processPendingPromos()
+  finally promoRunning = false
+```
+
+**Why guards matter at all:** without them, two runs could connect the **same
+`session_string` concurrently** → Telegram invalidates the auth key (`AUTH_KEY_DUPLICATED`)
+→ **account permanently lost.** Session-level collisions between the trigger and promo paths
+are additionally prevented by the `activeSessions` guard (§2.5).
+
+### 2.2 `runTrigger()` — the top-level sweep order  ⟳ updated
 
 ```
 runTrigger()
   │
-  ├─ 1. promoProcessed = await processPendingPromos()   ← PROMO FIRST
-  │        returns Set<user_id> touched this run
+  ├─ 1. promoProcessed = (await runPromoSweep()) || new Set()   ← PROMO FIRST, via shared guard
+  │        · returns Set<user_id> touched this run
+  │        · returns null if a /promo push is already sweeping → treated as empty Set
   │
   ├─ 2. accounts  = await getAccountsDue()              ← claim due accounts
   │     remaining = accounts.filter(a => !promoProcessed.has(a.user_id))
   │                 ▲ skip anyone already handled by promo this run
-  │                 (prevents same-session double-connect = AUTH_KEY_DUPLICATED)
   │
   └─ 3. for (acc of remaining):
              await processAccount(acc)
@@ -165,10 +197,13 @@ tell the app **which task was actually due**.
 > Note: `processAccount` recomputes due-ness from `acc.next_*_time`, which the RPC maps
 > to the *original* pre-bump times — so the "what's due" decision uses real due times.
 
-### 2.4 `processAccount(acc)` — per-account dispatch
+### 2.4 `processAccount(acc)` — per-account dispatch (normal sweep)
 
 ```
 processAccount(acc)
+  │
+  ├─ if activeSessions.has(user_id) → skip ("session in flight (promo)")   ← §2.5
+  ├─ activeSessions.add(user_id)
   │
   ├─ client = new TelegramClient(session_string, {connectionRetries:5,
   │                              receiveUpdates:false, autoReconnect:false})
@@ -185,7 +220,7 @@ processAccount(acc)
   ├─ if leaveDue:    try leaveChannels() catch → log only
   │        ▲ EACH ACTION IS INDEPENDENT — one throwing does NOT skip the others
   │
-  └─ finally: sleep(500ms) → client.destroy()  "🔌 Disconnected"
+  └─ finally: sleep(500ms) → client.destroy()  → activeSessions.delete(user_id)
 ```
 
 **Clicker error taxonomy (catch block):**
@@ -201,6 +236,19 @@ Daily uses a similar split: a transient list (`SPONSOR_UNRESOLVABLE`, `MENU_NOT_
 `PROFILE_NOT_FOUND`, `DAILY_BTN_NOT_FOUND`, `MESSAGE_ID_INVALID`, `TIMEOUT`) → reschedule
 in 15 min; anything else → `incrementError` + notify.
 
+### 2.5 `activeSessions` — cross-path session lock  ⟳ new
+
+A module-level `Set<user_id>`. Because `/trigger` and `/promo` now run independently, the
+**same session must never be connected by both at once** (→ `AUTH_KEY_DUPLICATED`). Every
+code path that connects a session claims its `user_id` here first and releases it in
+`finally`:
+
+- `processAccount` (trigger path) — skips the account this sweep if already in flight.
+- `processPromoAccount` (promo path) — skips the account this run if already in flight.
+
+Net effect: promo redemption wins the race for a session; a clicker/daily that was due at
+the same moment simply slips to the next sweep. Correct trade for a 1–2 min promo window.
+
 ---
 
 ## 3. The four bot actions in detail
@@ -215,6 +263,10 @@ Shared helpers:
 - `getCallbackAnswer()` — safe callback click; swallows `MESSAGE_ID_INVALID` → `"MESSAGE_EXPIRED"`.
 - `solveCaptcha()` / `withCaptcha(action)` — see §3.5.
 - `jitter()` = 4–6 s human-like delay; `sleep()` everywhere.
+
+> The per-action delays (jitter, captcha waits, button round-trips) are **intentional** —
+> the bot is not fast and needs time to render inline buttons. Do NOT trim them; promo speed
+> comes from starting sooner (push) and concurrency, not from shorter sleeps.
 
 ### 3.1 CLICKER — `doClicker()`  (the money-maker)
 
@@ -325,9 +377,12 @@ _doPromoAttempt():
 **`isPromoGated(text)`** trips on: `подпишись`, `подписаться`, `вступи в`,
 `выполни задани`, `выполни хотя бы`, `выполни всего`. **Design choice:** gated promos are
 recorded terminally and never retried — limited activations are better spent on accounts
-that can claim instantly, instead of burning time doing sponsor tasks.
+that can claim instantly, instead of burning time doing sponsor tasks. (Checked AFTER
+success/already/exhausted, so a clean success is never misread as gated.)
 
-### 3.3.1 PROMO orchestration — `processPendingPromos()` (called first in runTrigger)
+### 3.3.1 PROMO orchestration — `processPendingPromos()`  ⟳ updated (rolling pool)
+
+Called via `runPromoSweep()` from BOTH `/trigger` (phase 1) and the `/promo` push.
 
 ```
 processPendingPromos()  → returns Set<user_id> processed
@@ -340,16 +395,22 @@ processPendingPromos()  → returns Set<user_id> processed
        ├─ accounts  = active accounts for THIS instance
        ├─ pending   = accounts NOT in attempted
        │
-       └─ process pending in BATCHES of PROMO_CONCURRENCY = 15:
-            ├─ re-check is_active before each batch → stop if exhausted
-            ├─ Promise.allSettled( batch.map(processPromoAccount) )
+       └─ ROLLING POOL of PROMO_CONCURRENCY (=15) workers over `pending`:
+            · poolSize = min(15, pending.length) runNext() coroutines run concurrently
+            · each runNext() pulls the next index off a shared cursor until drained
+            · NO batch barrier — a fast account never waits on a slow one
+            · every ~15 starts: re-check is_active → stop early if exhausted
+            · first pool-fill is ramped (idx*400ms stagger) to avoid lockstep connects
             │
             processPromoAccount(acc, idx):
               ├─ if exhaustedFlag → return
-              ├─ stagger: sleep(idx * 400 ms)   ← don't hit bot in lockstep (↓FLOOD_WAIT)
+              ├─ if idx>0 (first fill) → stagger sleep(idx*400ms)   (↓ FLOOD_WAIT)
+              ├─ if activeSessions.has(user_id) → skip (session lock, §2.5)
+              ├─ activeSessions.add(user_id); promoInFlight++  (logged: "in-flight: N")
               ├─ fresh TelegramClient (autoReconnect:false)
               ├─ withTimeout(connect, 60 s) ; withTimeout(doPromo, 180 s)
               ├─ status == "exhausted" → exhaustedFlag = true
+              ├─ finally: destroy() → activeSessions.delete(user_id) → promoInFlight--
               ├─ processed.add(user_id)          ← ALWAYS (prevents same-run re-touch)
               │
               └─ RECORD only if TERMINAL:
@@ -359,13 +420,22 @@ processPendingPromos()  → returns Set<user_id> processed
                      (UNIQUE(promo_code_id,user_id) makes it idempotent; 23505 ignored)
                    "failed" is TRANSIENT → NOT recorded → retried next sweep
        │
-       └─ after batches: if exhaustedFlag → UPDATE promo_codes SET is_active=false
+       └─ after pool drains: if exhaustedFlag → UPDATE promo_codes SET is_active=false
 ```
 
 **Key safety properties:**
-- `withTimeout` (gramjs #691 workaround) guarantees a hung `connect()` can't freeze a batch.
-- `processed.add()` runs for **every** outcome so a session is never connected twice in one run.
-- Only terminal outcomes are persisted; `failed` stays retriable → no promo silently lost.
+- **Rolling pool, not barriered batches** — continuous refill maximizes activations before
+  a code dies (~1–2 min). This replaced the old batch-of-15 barrier.
+- `exhaustedFlag` short-circuits the pool the instant any account hits "exhausted", and
+  flips `is_active=false` so all other instances stop within seconds.
+- `withTimeout` (gramjs #691 workaround) guarantees a hung `connect()` can't freeze the pool.
+- `processed.add()` + `activeSessions` together ensure a session is never connected twice.
+- Only terminal outcomes persist; `failed` stays retriable → no promo silently lost.
+- **`PROMO_CONCURRENCY` reality check:** FLOOD limits are per-account, so 15 *distinct*
+  sessions is safe from Telegram's per-account limiter. The real risks are (a) two promo
+  sweeps overlapping (solved by the shared `promoRunning` guard), (b) bot-side anti-spam from
+  many accounts messaging one bot at once. Don't raise 15 without watching `in-flight` logs
+  and FLOOD rates.
 
 ### 3.4 TASKS — `handleTasks()`  (sub-flow, only invoked by the clicker task-gate)
 
@@ -449,23 +519,24 @@ leaveChannels(userId):
 
 ---
 
-## 4. `promo/monitor.js` — THE PROMO DETECTOR (separate service)
+## 4. `promo/monitor.js` — THE PROMO DETECTOR (separate service)  ⟳ updated
 
-Watches source channel **@patrickstarsfarm** and writes discovered codes to `promo_codes`.
-The worker (`index.js`) picks them up on its next trigger — the two never call each other.
+Watches source channel **@patrickstarsfarm**, writes discovered codes to `promo_codes`, and
+**pushes** each worker's `/promo` endpoint so redemption starts in seconds instead of waiting
+for the next 5-min sweep.
 
 ```
 main()
   ├─ connect user-client (MONITOR_SESSION) → joinChannel(@patrickstarsfarm)
-  ├─ checkHistory(): scan last 20 msgs, insert any untracked codes, set last_seen_msg_id
-  ├─ registerEventHandler(): NewMessage listener  ← PRIMARY real-time detection
+  ├─ checkHistory(): scan last 20 msgs, insert any untracked codes (push=FALSE), set last_seen
+  ├─ registerEventHandler(): NewMessage listener  ← PRIMARY real-time detection (push=TRUE)
   ├─ Express:
-  │     GET /       → pollChannel() (debounced 5 s) + keep-alive   ← cron every 1 min
+  │     GET /       → pollChannel() (debounced 5 s) + keep-alive   ← cron every 1 min (push=TRUE)
   │     GET /health → JSON {connected, channel_reachable, last_seen_msg_id}  ← UptimeRobot 5 min
-  ├─ setInterval(pollChannel, 30 s)   ← safety-net backup detection
+  ├─ setInterval(pollChannel, 30 s)   ← safety-net backup detection (push=TRUE)
   └─ auto-reconnect (ensureConnected) on lost connection
 
-Detection paths → all funnel into handleNewCode():
+Detection paths → all funnel into handleNewCode(code, meta, raw, push=true):
 
   extractPromos(text):
      for each line containing "Ловите дейли промо":
@@ -474,17 +545,31 @@ Detection paths → all funnel into handleNewCode():
         code            = text after last ":" (or next non-empty line)
                           strip || ** * _ ; reject if http/t.me/len<2/len>60
 
-  handleNewCode(code, meta, raw):
+  handleNewCode(code, meta, raw, push):
      INSERT promo_codes {code, raw_message[:500], stars_amount, max_activations}
-        · dup (23505) → skip (UNIQUE on code)
-        · else saved → "instances will pick up on next trigger"
+        · dup (23505) → skip (UNIQUE on code) — NO push (not a new code)
+        · else saved  → if push: pushToInstances(code)   ← fire-and-forget
+
+  pushToInstances(code):
+     for each base in INSTANCE_URLS (comma-separated env):
+        GET `${base}/promo`  with 8 s AbortController timeout
+        Promise.allSettled → one dead instance never blocks the others
 
 Progress tracking:  monitor_state key "last_seen_msg_id"  (get/setLastSeenMsgId)
 ```
 
+**Push discipline (important):**
+- Real-time paths (event handler, 1-min poll, 30-s interval) call with **`push=true`**.
+- **`checkHistory()` (startup backfill) calls with `push=false`** — the last-20 scan is full
+  of already-expired codes; pushing them would wake every instance to redeem dead promos on
+  every restart. Backfill inserts them (so they're deduped later) but does NOT push.
+
 **Three redundant detection layers** (belt-and-suspenders): real-time event handler +
 per-minute HTTP poll + 30 s interval poll, all debounced and idempotent via the UNIQUE
 constraint on `promo_codes.code`.
+
+**Env:** `API_ID`, `API_HASH`, `MONITOR_SESSION`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`,
+`INSTANCE_URLS` (comma-separated worker base URLs, no trailing `/promo`), `PORT`.
 
 ---
 
@@ -496,15 +581,22 @@ constraint on `promo_codes.code`.
 |---|---|---|
 | `accounts` | one row per Telegram account | `instance_id (1–12)`, `user_id`, `session_string`, `is_active`, `next_clicker_time`, `next_daily_time`, `next_leave_time`, `cap`, `total_clicks`, `total_dailies`, `error_count`, `last_error` |
 | `balances` | balance snapshot per daily claim | `user_id`, `stars`, `referrals`, `checked_at` (+ view `latest_balances` = DISTINCT ON user_id) |
-| `promo_codes` | detected codes | `code` (UNIQUE), `is_active`, `stars_amount`, `max_activations`, `raw_message` |
-| `promo_redemptions` | per-account attempt log | `UNIQUE(promo_code_id, user_id)`, `status`, `instance_id`, `result_text` |
-| `monitor_state` | detector progress | key/value → `last_seen_msg_id` |
+| `promo_codes` | detected codes | `code` (UNIQUE), `is_active`, `stars_amount`, `max_activations`, `raw_message`, `detected_at` |
+| `promo_redemptions` | per-account attempt log | `UNIQUE(promo_code_id, user_id)`, `status CHECK IN (success,already_used,exhausted,gated)`, `instance_id`, `result_text` |
+| `monitor_state` | detector progress | key/value JSONB → `last_seen_msg_id` |
 | `protected_channels` | never-leave list (telegap) | `channel_id` PK |
 
 `accounts` also has a `BEFORE UPDATE` trigger keeping `updated_at` fresh, and partial
 indexes on each `next_*_time WHERE is_active`.
 
-### 5.2 The four atomic RPCs (why they exist: no read-modify-write races across 12 instances)
+> **⚠️ `status` CHECK must include `'gated'`.** The code inserts `gated` as a terminal
+> status. An older `migration.sql` allowed only `(success, already_used, exhausted, failed)`
+> — that rejected every gated insert (Postgres `23514`, which the code does NOT ignore), so
+> gated accounts retried the same dead promo on **every** sweep forever. Fixed in
+> `promo/migration.sql`. Authoritative DDL for the 3 promo tables lives there; `schema.sql`
+> also carries a reproducibility copy (with plain-TEXT status, no CHECK).
+
+### 5.2 The four atomic RPCs (why they exist: no read-modify-write races across instances)
 
 ```
 claim_due_accounts(instance, now, clk_min, clk_max, daily_delay)
@@ -533,45 +625,45 @@ Callers: `record_click` (doClicker success), `record_daily` (doDaily success),
 
 ---
 
-## 6. End-to-end lifecycle (one full trigger)
+## 6. End-to-end lifecycle  ⟳ updated
 
 ```
-UptimeRobot ─GET /trigger─▶ index.js (Instance N)
-     │
-     │ triggerRunning guard  (skip if a sweep is already in flight)
-     ▼
-runTrigger():
-  ┌──────────────────────────────────────────────────────────────────────┐
-  │ (1) processPendingPromos()                                            │
-  │     promo_codes(is_active) → per code → pending accounts →            │
-  │     batches of 15 → each: connect → doPromo → record if terminal      │
-  │     → exhaust code if "exhausted"  → return Set<user_id>              │
-  └──────────────────────────────────────────────────────────────────────┘
-                         │  promoProcessed
-                         ▼
-  ┌──────────────────────────────────────────────────────────────────────┐
-  │ (2) getAccountsDue() → claim_due_accounts (SKIP LOCKED + bump)        │
-  │     remaining = due − promoProcessed                                  │
-  └──────────────────────────────────────────────────────────────────────┘
-                         │  for each remaining (sequential, 1–3 s gap)
-                         ▼
-  ┌──────────────────────────────────────────────────────────────────────┐
-  │ (3) processAccount(acc):  connect ONE session                        │
-  │       clickerDue → doClicker → record_click                          │
-  │       dailyDue   → doDaily   → record_daily + storeBalance           │
-  │       leaveDue   → leaveChannels                                     │
-  │       (each independent; errors → taxonomy → reschedule/notify)      │
-  │       finally destroy()                                               │
-  └──────────────────────────────────────────────────────────────────────┘
+                  ┌─────────────────────── promo/monitor.js ───────────────────────┐
+                  │ watches @patrickstarsfarm (event + 1-min poll + 30-s interval)  │
+                  │ new code → INSERT promo_codes → pushToInstances(code)           │
+                  └───────────────┬────────────────────────────────────────────────┘
+                                  │ GET /promo  (fire-and-forget, 8s timeout each)
+                                  ▼
+   ┌──────────── index.js (Instance N) ────────────────────────────────────────────┐
+   │                                                                                │
+   │  GET /promo ─────► runPromoSweep() ──┐                                         │
+   │                                       ├──(shared promoRunning guard)──► processPendingPromos()
+   │  GET /trigger ─► runTrigger() phase 1─┘                                        │
+   │                          │ phase 2                                             │
+   │                          ▼                                                     │
+   │   getAccountsDue() → claim_due_accounts (SKIP LOCKED + bump)                   │
+   │   remaining = due − promoProcessed                                            │
+   │        │ for each remaining (sequential, 1–3 s gap)                            │
+   │        ▼                                                                       │
+   │   processAccount(acc): connect ONE session (activeSessions lock)              │
+   │       clickerDue → doClicker → record_click                                    │
+   │       dailyDue   → doDaily   → record_daily + storeBalance                     │
+   │       leaveDue   → leaveChannels                                               │
+   │       (each independent; errors → taxonomy → reschedule/notify)               │
+   │       finally destroy()                                                        │
+   └────────────────────────────────────────────────────────────────────────────────┘
 
-Meanwhile, continuously & independently:
-  promo/monitor.js  ── watches @patrickstarsfarm ──▶ INSERT promo_codes
-                        (event + 1-min poll + 30-s interval)
+processPendingPromos() detail:
+  promo_codes(is_active) → per code → pending accounts (minus already-attempted)
+  → ROLLING POOL of 15 (continuous refill, no barrier)
+  → each: activeSessions-lock → connect → doPromo → record if terminal
+  → first "exhausted" flips is_active=false → all instances stop within seconds
+  → return Set<user_id>
 ```
 
 ---
 
-## 7. Cheat-sheet of every timing constant (`index.js`)
+## 7. Cheat-sheet of every timing / concurrency constant (`index.js`)
 
 | Constant | Value | Used for |
 |---|---|---|
@@ -584,7 +676,34 @@ Meanwhile, continuously & independently:
 | `CHANNEL_LIMIT_DELAY` | 10 h | after CHANNELS_TOO_MUCH |
 | `NO_TASKS_DELAY` | 30 min | clicker gated but no tasks available |
 | `LEAVE_DELAY_MIN/MAX` | 24 / 48 h | next channel cleanup |
-| `PROMO_CONCURRENCY` | 15 | promo accounts per batch |
+| `PROMO_CONCURRENCY` | 15 | rolling-pool size (max sessions in flight per promo sweep) |
+| `promoInFlight` | (runtime) | live in-flight counter, logged per account to verify concurrency |
 | `jitter()` | 4–6 s | human-like click delay |
+| stagger (first pool fill) | idx × 400 ms | de-lockstep initial connects (↓ FLOOD_WAIT) |
 | connect / promo timeouts | 60 s / 180 s | `withTimeout` ceilings |
+
+---
+
+## 8. Deployment (Render)
+
+Each process is its own node. Order matters on changes to the promo path.
+
+**Workers (`index.js`, ×N):** repo root. Build `npm install`, start `npm start`.
+Env: `INSTANCE_ID`, `API_ID`, `API_HASH`, `SUPABASE_URL`, `SUPABASE_ANON_KEY` (+ Render's `PORT`).
+Must expose `GET /promo` (present after the fast-path change) or the monitor's push 404s and
+silently falls back to the 5-min sweep.
+
+**Monitor (`promo/monitor.js`, ×1):** **separate Render service**, Root Directory `promo/`
+(has its own `package.json`, deps: telegram, @supabase/supabase-js, dotenv, express; `engines`
+node ≥18 for global `fetch`). Build `npm install`, start `npm start`.
+Env from `promo/.env.example`: `API_ID`, `API_HASH`, `MONITOR_SESSION`, `SUPABASE_URL`,
+`SUPABASE_ANON_KEY`, `INSTANCE_URLS` (comma-separated worker URLs, no `/promo` suffix).
+
+**Keep-alive:** UptimeRobot/cron → workers `GET /trigger` every 5 min; monitor `GET /`
+every 1 min + `GET /health` every 5 min.
+
+**Deploy order for promo changes:**
+1. Run `promo/migration.sql` in Supabase (drops & recreates the 3 promo tables — `gated` allowed).
+2. Redeploy all workers (so `/promo` exists).
+3. Deploy/redeploy the monitor with `INSTANCE_URLS` set.
 ```
