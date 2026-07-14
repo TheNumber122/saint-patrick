@@ -620,9 +620,16 @@ async function handleTasks(client, userId) {
 
   for (let i = 0; i < 5; i++) {
     console.log(`[TASK] Attempt ${i + 1}/5`);
-    msgs = await client.getMessages(BOT, { limit: 3 });
+    msgs = await client.getMessages(BOT, { limit: 5 });
+    // Match any task flavor — "Новое задание", "Специальное задание", etc. —
+    // but ONLY messages newer than our fresh menu: the unskippable task the
+    // bot pushed BEFORE our /start is still in history and must never be
+    // picked up (it's the whole reason we /start-ed).
     const taskMsg = msgs.find(
-      (m) => m.text?.includes("Новое задание") && m.replyMarkup,
+      (m) =>
+        /задание/i.test(m.text || "") &&
+        m.replyMarkup &&
+        m.id > freshMenu.id,
     );
     if (!taskMsg) {
       console.log("[TASK] No more tasks");
@@ -633,7 +640,10 @@ async function handleTasks(client, userId) {
     for (const row of taskMsg.replyMarkup.rows)
       for (const btn of row.buttons) {
         if (btn.url) buttons.action = btn;
-        if (btn.text?.includes("Подтвердить")) buttons.verify = btn;
+        // Verify wording varies per task type: "Подтвердить (подписку)" on
+        // channel tasks, "Я изучил" on link/study tasks, "Я выполнил" variants.
+        if (btn.text?.includes("Подтвердить") || btn.text?.includes("Я изучил") || btn.text?.includes("Я выполнил"))
+          buttons.verify = btn;
         if (btn.text?.includes("Пропустить")) buttons.skip = btn;
         if (btn.text?.includes("главное меню") || btn.text?.includes("Главное меню")) buttons.mainMenu = btn;
       }
