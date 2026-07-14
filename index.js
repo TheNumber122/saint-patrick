@@ -222,6 +222,23 @@ function resolveUrl(url) {
   return url;
 }
 
+// Telegram changed its link domain — links now arrive as t.me OR telegram.me.
+// Every URL classifier (tasks + sponsor) must accept both.
+const TG_BOT_START = /(?:t|telegram)\.me\/([^?/]+)\?start=(.+)/;
+const TG_ANY_LINK  = /(?:t|telegram)\.me\/(.+)/;
+const TG_USERNAME  = /(?:t|telegram)\.me\/([^/?]+)/;
+const isTelegramUrl = (u) => /(?:t|telegram)\.me\//.test(u);
+
+// Task verdict from a verify popup. "Задание не выполнено" CONTAINS
+// "выполнено", so a plain .includes("выполнено") reads the FAIL popup as
+// success — that bug burned whole clicker cycles. Check failure first.
+function taskVerdict(popup) {
+  if (!popup) return "none";
+  if (popup.includes("не выполнено")) return "fail";
+  if (popup.includes("выполнено") || popup.includes("получена")) return "success";
+  return "other";
+}
+
 // ============================================
 // CAPTCHA
 // ============================================
@@ -287,7 +304,7 @@ async function withCaptcha(client, action) {
 // ============================================
 // MENU
 // ============================================
-async function ensureMenu(client) {
+async function ensureMenu(client, { skipSponsor = false } = {}) {
   let msgs = await client.getMessages(BOT, { limit: 5 });
   let menu = msgs.find(
     (m) => m.text?.includes("Получи свою личную ссылку") && m.replyMarkup,
@@ -312,6 +329,10 @@ async function ensureMenu(client) {
       m.replyMarkup,
   );
   if (sponsorMsg) {
+    // Promo path: a sponsor screen means this account can't claim NOW.
+    // Resolving one costs 40–120s of a pool seat while the code is dying —
+    // skip the account instead (recorded as gated), same as task-gated promos.
+    if (skipSponsor) throw new Error("SPONSOR_GATED");
     console.log(`[SPONSOR] Blocking screen — resolving...`);
     const resolved = await handleSponsor(client, sponsorMsg);
     if (!resolved) throw new Error("SPONSOR_UNRESOLVABLE");
@@ -380,8 +401,8 @@ async function handleSponsor(client, sponsorMsg) {
       await sleep(2000 + Math.random() * 2000);
 
       try {
-        const botMatch = url.match(/t\.me\/([^?/]+)\?start=(.+)/);
-        const channelMatch = !botMatch && url.match(/t\.me\/(.+)/);
+        const botMatch = url.match(TG_BOT_START);
+        const channelMatch = !botMatch && url.match(TG_ANY_LINK);
 
         if (botMatch) {
           console.log(`[SPONSOR] Starting bot @${botMatch[1]}`);
@@ -402,7 +423,7 @@ async function handleSponsor(client, sponsorMsg) {
               await joinChannel(client, "patrickgames_news", "SPONSOR");
             });
           } else {
-            const bot = url.match(/t\.me\/([^/?]+)/)?.[1];
+            const bot = url.match(TG_USERNAME)?.[1];
             if (bot) {
               console.log(`[SPONSOR] Webapp /start @${bot}`);
               await withCaptcha(client, async () => {
@@ -449,7 +470,7 @@ async function handleSponsor(client, sponsorMsg) {
         const burl = resolveUrl(btn.url || "");
         if (!burl.includes("startapp") || burl.includes("patrickgamesbot"))
           continue;
-        const bot = burl.match(/t\.me\/([^/?]+)/)?.[1];
+        const bot = burl.match(TG_USERNAME)?.[1];
         if (!bot) continue;
         try {
           const peer = await client.getEntity(bot);
@@ -554,15 +575,27 @@ async function leaveChannels(client, userId) {
 // ============================================
 async function handleTasks(client, userId) {
   console.log("[TASK] Starting...");
-  const menu = await ensureMenu(client);
 
-  // Re-fetch fresh before clicking to avoid stale message ID
-  await sleep(1000);
+  // The task-gate popup comes WITH an unprompted sponsor-style task message
+  // already pushed into the chat (no Пропустить button, usually a website
+  // link). Never process that pushed task: send a fresh /start to get the
+  // menu back, then enter tasks through 📝 Задания — tasks served that way
+  // have a skip button. (/start before doing any task is safe; the "no /start
+  // after completing tasks" rule protects the bot's task counter, which is
+  // only relevant AFTER a completion.)
+  await withCaptcha(client, async () => {
+    await client.sendMessage(BOT, { message: "/start" });
+    await sleep(4000);
+  });
+
   const freshMsgs = await client.getMessages(BOT, { limit: 5 });
-  const freshMenu =
-    freshMsgs.find(
-      (m) => m.text?.includes("Получи свою личную ссылку") && m.replyMarkup,
-    ) || menu;
+  let freshMenu = freshMsgs.find(
+    (m) => m.text?.includes("Получи свою личную ссылку") && m.replyMarkup,
+  );
+  if (!freshMenu) {
+    // Menu didn't render (sponsor screen, slow bot) — ensureMenu resolves it
+    freshMenu = await ensureMenu(client);
+  }
 
   await withCaptcha(client, async () => {
     await sleep(jitter());
@@ -613,11 +646,11 @@ async function handleTasks(client, userId) {
     const url = resolveUrl(buttons.action.url);
     console.log(`[TASK] ${buttons.action.text} → ${url}`);
 
-    if (
-      url.includes("flocktory.com/exchange/login") ||
-      url.includes("share.flocktory.com/exchange/login")
-    ) {
-      console.log("[TASK] Flocktory init detected — skipping task");
+    // Website links (anything not t.me/telegram.me) can't be completed by a
+    // Telegram client — skip immediately, no fake "visit". Same for linknibot:
+    // a webapp that only advertises other bots, starting it is wasted time.
+    if (!isTelegramUrl(url) || url.toLowerCase().includes("linknibot")) {
+      console.log(`[TASK] ${!isTelegramUrl(url) ? "Website link" : "linknibot"} — skipping task`);
       if (buttons.skip) {
         await withCaptcha(client, async () => {
           await sleep(1500);
@@ -625,7 +658,7 @@ async function handleTasks(client, userId) {
           await sleep(2000);
         });
       } else if (buttons.mainMenu) {
-        console.log("[TASK] Flocktory + no skip — going to main menu");
+        console.log("[TASK] Unskippable — going to main menu");
         await getCallbackAnswer(client, taskMsg, buttons.mainMenu.data);
         await sleep(2000);
         break;
@@ -636,7 +669,7 @@ async function handleTasks(client, userId) {
     let entity = null;
 
     if (url.includes("?start=") && !url.includes("startapp")) {
-      const m = url.match(/t\.me\/([^?]+)\?start=(.+)/);
+      const m = url.match(/(?:t|telegram)\.me\/([^?/]+)\?start=(.+)/);
       if (m) {
         console.log(`[TASK] Bot: @${m[1]}`);
         await withCaptcha(client, async () => {
@@ -659,14 +692,16 @@ async function handleTasks(client, userId) {
           if (r !== "failed") entity = { type: "channel" };
         });
       } else {
-        const bot = url.match(/t\.me\/([^/?]+)/)?.[1];
+        const bot = url.match(/(?:t|telegram)\.me\/([^/?]+)/)?.[1];
         if (bot) {
           console.log(`[TASK] Webapp /start @${bot}`);
           try {
             await withCaptcha(client, async () => {
               await client.sendMessage(bot, { message: "/start" });
             });
-            await sleep(3000 + Math.random() * 2000);
+            // Generous settle time — starting the bot (not the webapp) needs
+            // to register on the task-checker's side before we hit verify.
+            await sleep(8000 + Math.random() * 4000);
             entity = { type: "webapp", bot, url };
           } catch (e) {
             console.log(`[TASK] Start @${bot} failed: ${e.message}`);
@@ -674,7 +709,7 @@ async function handleTasks(client, userId) {
         }
       }
     } else {
-      const m = url.match(/t\.me\/(.+)/);
+      const m = url.match(/(?:t|telegram)\.me\/(.+)/);
       if (m) {
         const id = m[1].split("?")[0];
         console.log(`[TASK] Channel: ${id}`);
@@ -714,9 +749,7 @@ async function handleTasks(client, userId) {
 
     if (popup === "MESSAGE_EXPIRED") {
       msgs = await client.getMessages(BOT, { limit: 3 });
-      const ok = msgs.find(
-        (m) => m.text?.includes("выполнено") || m.text?.includes("получена"),
-      );
+      const ok = msgs.find((m) => taskVerdict(m.text) === "success");
       if (ok || entity) {
         console.log("[TASK] ✅ Success");
         completed++;
@@ -727,9 +760,29 @@ async function handleTasks(client, userId) {
 
     console.log(`[TASK] Popup: ${popup || "none"}`);
 
-    if (popup?.includes("выполнено") || popup?.includes("получена")) {
+    if (taskVerdict(popup) === "success") {
       console.log("[TASK] ✅ Success");
       completed++;
+      break;
+    }
+
+    // Explicit fail popup ("Задание не выполнено... пропусти") — for a webapp
+    // task this means it truly requires opening the web application, which we
+    // deliberately never do. Skip, exactly as the popup itself suggests.
+    if (taskVerdict(popup) === "fail") {
+      console.log("[TASK] ❌ Bot says not done — skipping task");
+      if (buttons.skip) {
+        await withCaptcha(client, async () => {
+          await sleep(1500);
+          await getCallbackAnswer(client, taskMsg, buttons.skip.data);
+          await sleep(2000);
+        });
+        continue;
+      }
+      if (buttons.mainMenu) {
+        await getCallbackAnswer(client, taskMsg, buttons.mainMenu.data);
+        await sleep(2000);
+      }
       break;
     }
 
@@ -756,7 +809,7 @@ async function handleTasks(client, userId) {
           buttons.verify.data,
         );
         console.log(`[TASK] Re-verify: ${popup2 || "none"}`);
-        if (popup2?.includes("выполнено") || popup2?.includes("получена")) {
+        if (taskVerdict(popup2) === "success") {
           console.log("[TASK] ✅ Success after fallback");
           completed++;
           break;
@@ -1191,8 +1244,14 @@ async function _doPromoAttempt(client, userId, code) {
 
   let menu;
   try {
-    menu = await ensureMenu(client);
+    menu = await ensureMenu(client, { skipSponsor: true });
   } catch (e) {
+    // Sponsor screen = account can't claim immediately → terminal "gated",
+    // recorded so it's never retried for this code (same as task-gated).
+    if (e.message === "SPONSOR_GATED") {
+      console.log(`[PROMO] Sponsor screen — gated, skipping account`);
+      return "gated";
+    }
     if (["SPONSOR_UNRESOLVABLE", "MENU_NOT_FOUND"].includes(e.message)) {
       console.log(`[PROMO] ${e.message} — skipping account`);
       return e.message;
@@ -1394,12 +1453,14 @@ async function processPendingPromos() {
           API_HASH,
           { connectionRetries: 5, receiveUpdates: false, autoReconnect: false },
         );
-        await withTimeout(client.connect(), 60000, "CONNECT");
+        // Tight ceilings for the promo race: a code lives ~1–2 min, so a seat
+        // held longer than that is a seat lost. A connect that needs >20s or a
+        // flow that needs >75s won't win a slot anyway — recycle the seat.
+        await withTimeout(client.connect(), 20000, "CONNECT");
 
-        // Hard ceiling per account so one stuck flow can't freeze the batch.
         status = await withTimeout(
           doPromo(client, acc.user_id, promo.code),
-          180000,
+          75000,
           "PROMO",
         );
 
