@@ -233,22 +233,28 @@ const isTelegramUrl = (u) => /(?:t|telegram)\.me\//.test(u);
 // SAVED LINKS — redirector URLs (go.botohub.me etc.)
 // Captcha-gated redirectors a TG client can't follow. You save
 // "URL → bot/channel" in the dashboard (Actions page); workers execute the
-// saved destination. Matched by shared-prefix ratio, not exact string: botohub
-// encodes the destination at the FRONT of the blob and varies a per-impression
-// token in the MIDDLE, so the same destination keeps a long common prefix while
-// a different destination diverges early. See URL-MAPPINGS.md.
+// saved destination. See URL-MAPPINGS.md.
+//
+// Matching an incoming URL to a saved one uses shared-prefix ratio
+// (shared front chars / longer length): same bot ≈ 0.76, different bot ≈ 0.37.
+// Two thresholds, picked per saved link:
+//   · LONER link (no other saved link is > SIBLING similar) → loose 0.60 cutoff.
+//   · TWIN link  (some other saved link IS > SIBLING similar) → strict 0.95,
+//     because a rotated token could otherwise tip a match to the wrong twin.
+// An incoming URL matching TWO saved links → skip (never guess).
+// The dashboard flags twin links so you can see which are confusable.
 // ============================================
-let savedLinks = []; // [{ url, dest_type, dest_value }]
-let savedLinksLoadedAt = 0;
+const LINK_LOOSE = 0.6;    // loner: generous, absorbs the rotating middle token
+const LINK_STRICT = 0.95;  // twin: near-exact to avoid picking the wrong sibling
+const LINK_SIBLING = 0.9;  // two saved links this close are "confusable"
 
-// ponytail: 0.6 sits well below observed same-dest (0.76) and above
-// different-dest (0.37); widen the gap only if a real collision shows up.
-const LINK_MATCH_RATIO = 0.6;
+let savedLinks = []; // [{ url, dest_type, dest_value, twin }]
+let savedLinksLoadedAt = 0;
 
 function prefixRatio(a, b) {
   let i = 0;
-  const max = Math.min(a.length, b.length);
-  while (i < max && a[i] === b[i]) i++;
+  const min = Math.min(a.length, b.length);
+  while (i < min && a[i] === b[i]) i++;
   return i / Math.max(a.length, b.length);
 }
 
@@ -258,20 +264,25 @@ async function getSavedLink(url) {
       .from("saved_links")
       .select("url, dest_type, dest_value");
     if (!error && data) {
+      // Flag "twin" links: any pair > LINK_SIBLING similar to each other.
+      for (const l of data)
+        l.twin = data.some((o) => o !== l && prefixRatio(l.url, o.url) > LINK_SIBLING);
       savedLinks = data;
       savedLinksLoadedAt = Date.now();
     }
   }
-  let best = null;
-  let bestRatio = LINK_MATCH_RATIO;
-  for (const l of savedLinks) {
-    const r = url === l.url ? 1 : prefixRatio(url, l.url);
-    if (r >= bestRatio) {
-      best = l;
-      bestRatio = r;
-    }
-  }
-  return best;
+
+  // Exact URL always wins outright, even among twins.
+  const exact = savedLinks.find((l) => l.url === url);
+  if (exact) return exact;
+
+  const matches = savedLinks.filter(
+    (l) => prefixRatio(url, l.url) >= (l.twin ? LINK_STRICT : LINK_LOOSE),
+  );
+  if (matches.length === 1) return matches[0];
+  if (matches.length > 1)
+    console.log("[LINK] Ambiguous — matches multiple saved links, skipping");
+  return null;
 }
 
 // dest_value: bot → "username" or "username?start=param"; channel → id/username
