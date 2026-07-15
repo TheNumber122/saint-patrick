@@ -233,10 +233,24 @@ const isTelegramUrl = (u) => /(?:t|telegram)\.me\//.test(u);
 // SAVED LINKS — redirector URLs (go.botohub.me etc.)
 // Captcha-gated redirectors a TG client can't follow. You save
 // "URL → bot/channel" in the dashboard (Actions page); workers execute the
-// saved destination on exact URL match. See URL-MAPPINGS.md.
+// saved destination. Matched by shared-prefix ratio, not exact string: botohub
+// encodes the destination at the FRONT of the blob and varies a per-impression
+// token in the MIDDLE, so the same destination keeps a long common prefix while
+// a different destination diverges early. See URL-MAPPINGS.md.
 // ============================================
-let savedLinks = new Map(); // url → { dest_type, dest_value }
+let savedLinks = []; // [{ url, dest_type, dest_value }]
 let savedLinksLoadedAt = 0;
+
+// ponytail: 0.6 sits well below observed same-dest (0.76) and above
+// different-dest (0.37); widen the gap only if a real collision shows up.
+const LINK_MATCH_RATIO = 0.6;
+
+function prefixRatio(a, b) {
+  let i = 0;
+  const max = Math.min(a.length, b.length);
+  while (i < max && a[i] === b[i]) i++;
+  return i / Math.max(a.length, b.length);
+}
 
 async function getSavedLink(url) {
   if (Date.now() - savedLinksLoadedAt > 600000) {
@@ -244,11 +258,20 @@ async function getSavedLink(url) {
       .from("saved_links")
       .select("url, dest_type, dest_value");
     if (!error && data) {
-      savedLinks = new Map(data.map((l) => [l.url, l]));
+      savedLinks = data;
       savedLinksLoadedAt = Date.now();
     }
   }
-  return savedLinks.get(url) || null;
+  let best = null;
+  let bestRatio = LINK_MATCH_RATIO;
+  for (const l of savedLinks) {
+    const r = url === l.url ? 1 : prefixRatio(url, l.url);
+    if (r >= bestRatio) {
+      best = l;
+      bestRatio = r;
+    }
+  }
+  return best;
 }
 
 // dest_value: bot → "username" or "username?start=param"; channel → id/username
