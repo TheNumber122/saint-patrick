@@ -229,6 +229,40 @@ const TG_ANY_LINK  = /(?:t|telegram)\.me\/(.+)/;
 const TG_USERNAME  = /(?:t|telegram)\.me\/([^/?]+)/;
 const isTelegramUrl = (u) => /(?:t|telegram)\.me\//.test(u);
 
+// ============================================
+// SAVED LINKS — redirector URLs (go.botohub.me etc.)
+// Captcha-gated redirectors a TG client can't follow. You save
+// "URL → bot/channel" in the dashboard (Actions page); workers execute the
+// saved destination on exact URL match. See URL-MAPPINGS.md.
+// ============================================
+let savedLinks = new Map(); // url → { dest_type, dest_value }
+let savedLinksLoadedAt = 0;
+
+async function getSavedLink(url) {
+  if (Date.now() - savedLinksLoadedAt > 600000) {
+    const { data, error } = await supabase
+      .from("saved_links")
+      .select("url, dest_type, dest_value");
+    if (!error && data) {
+      savedLinks = new Map(data.map((l) => [l.url, l]));
+      savedLinksLoadedAt = Date.now();
+    }
+  }
+  return savedLinks.get(url) || null;
+}
+
+// dest_value: bot → "username" or "username?start=param"; channel → id/username
+async function executeSavedLink(client, link, tag) {
+  if (link.dest_type === "channel") {
+    const r = await joinChannel(client, link.dest_value.replace(/^@/, ""), tag);
+    return r !== "failed";
+  }
+  const [bot, param] = link.dest_value.replace(/^@/, "").split("?start=");
+  console.log(`[${tag}] Saved link → bot @${bot}${param ? ` start=${param}` : ""}`);
+  await client.sendMessage(bot, { message: param ? `/start ${param}` : "/start" });
+  return true;
+}
+
 // Task verdict from a verify popup. "Задание не выполнено" CONTAINS
 // "выполнено", so a plain .includes("выполнено") reads the FAIL popup as
 // success — that bug burned whole clicker cycles. Check failure first.
@@ -403,8 +437,15 @@ async function handleSponsor(client, sponsorMsg) {
       try {
         const botMatch = url.match(TG_BOT_START);
         const channelMatch = !botMatch && url.match(TG_ANY_LINK);
+        // URL saved in the dashboard → execute its bot/channel destination.
+        const saved = await getSavedLink(url);
 
-        if (botMatch) {
+        if (saved) {
+          await withCaptcha(client, async () => {
+            await executeSavedLink(client, saved, "SPONSOR");
+          });
+          await sleep(3000 + Math.random() * 2000);
+        } else if (botMatch) {
           console.log(`[SPONSOR] Starting bot @${botMatch[1]}`);
           await withCaptcha(client, async () => {
             await client.sendMessage(botMatch[1], {
@@ -656,10 +697,13 @@ async function handleTasks(client, userId) {
     const url = resolveUrl(buttons.action.url);
     console.log(`[TASK] ${buttons.action.text} → ${url}`);
 
+    // URL saved in the dashboard → execute its bot/channel destination.
+    const saved = await getSavedLink(url);
+
     // Website links (anything not t.me/telegram.me) can't be completed by a
     // Telegram client — skip immediately, no fake "visit". Same for linknibot:
     // a webapp that only advertises other bots, starting it is wasted time.
-    if (!isTelegramUrl(url) || url.toLowerCase().includes("linknibot")) {
+    if (!saved && (!isTelegramUrl(url) || url.toLowerCase().includes("linknibot"))) {
       console.log(`[TASK] ${!isTelegramUrl(url) ? "Website link" : "linknibot"} — skipping task`);
       if (buttons.skip) {
         await withCaptcha(client, async () => {
@@ -678,7 +722,13 @@ async function handleTasks(client, userId) {
 
     let entity = null;
 
-    if (url.includes("?start=") && !url.includes("startapp")) {
+    if (saved) {
+      await withCaptcha(client, async () => {
+        if (await executeSavedLink(client, saved, "TASK"))
+          entity = { type: saved.dest_type };
+      });
+      if (entity?.type === "bot") await sleep(8000 + Math.random() * 4000);
+    } else if (url.includes("?start=") && !url.includes("startapp")) {
       const m = url.match(/(?:t|telegram)\.me\/([^?/]+)\?start=(.+)/);
       if (m) {
         console.log(`[TASK] Bot: @${m[1]}`);

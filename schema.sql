@@ -437,3 +437,29 @@ CREATE TABLE IF NOT EXISTS monitor_heartbeat (
 CREATE INDEX IF NOT EXISTS idx_monitor_heartbeat_ts ON monitor_heartbeat(ts DESC);
 
 GRANT ALL ON monitor_heartbeat TO anon, authenticated, service_role;
+
+
+-- ============================================================
+-- 10. SAVED LINKS — redirector links in tasks/sponsors
+--
+-- Task/sponsor buttons sometimes carry redirector URLs
+-- (go.botohub.me/r/<blob>) that land on a Telegram bot/channel
+-- behind a captcha page. Workers can't follow them, so you save
+-- "this URL = this bot/channel" in the dashboard (Actions page)
+-- and workers execute the saved destination on exact URL match.
+-- See URL-MAPPINGS.md for the future per-user-URL risk.
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS saved_links (
+  id         BIGSERIAL PRIMARY KEY,
+  url        TEXT NOT NULL UNIQUE,          -- exact full redirector URL
+  dest_type  TEXT NOT NULL CHECK (dest_type IN ('bot', 'channel')),
+  dest_value TEXT NOT NULL,                 -- bot: "username?start=param" or "username"; channel: id/username
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+COMMENT ON TABLE saved_links IS
+  'Redirector URL → Telegram destination, managed from the dashboard Actions page.';
+
+GRANT ALL PRIVILEGES ON TABLE saved_links TO anon, authenticated, service_role;
+GRANT USAGE, SELECT ON SEQUENCE saved_links_id_seq TO anon, authenticated, service_role;
