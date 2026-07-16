@@ -599,11 +599,18 @@ async function leaveChannels(client, userId) {
   // protected list, leave nothing so we never lose a telegap channel.
   let protectedIds = new Set();
   try {
-    const { data, error } = await supabase
-      .from("protected_channels")
-      .select("channel_id");
-    if (error) throw error;
-    protectedIds = new Set((data || []).map((r) => String(r.channel_id)));
+    // Supabase caps a plain select at 1000 rows — paginate so all protected
+    // channels load (we have 8k+). Missing any = fail-open = lost channel.
+    protectedIds = new Set();
+    for (let from = 0; ; from += 1000) {
+      const { data, error } = await supabase
+        .from("protected_channels")
+        .select("channel_id")
+        .range(from, from + 999);
+      if (error) throw error;
+      for (const r of data || []) protectedIds.add(String(r.channel_id));
+      if (!data || data.length < 1000) break;
+    }
     console.log(`[LEAVE] ${protectedIds.size} protected channel(s) loaded`);
   } catch (e) {
     console.log(`[LEAVE] protected fetch failed: ${e.message}`);
