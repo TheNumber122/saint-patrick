@@ -453,10 +453,13 @@ handleTasks()
         │
         ├─ flocktory login URL     → SKIP task (skip btn, else mainMenu, else break)
         ├─ url ?start= (bot)        → sendMessage(bot, "/start <param>")   entity=bot
-        ├─ url startapp:
+        ├─ url startapp (webapp — never opened):
         │     patrickgamesbot       → joinChannel("patrickgames_news")
         │     MyChimpBot            → joinChannel("mychimp")
-        │     other webapp          → sendMessage(bot,"/start"); entity=webapp
+        │     other webapp          → sendMessage(bot, "/start <startapp param>")  entity=webapp
+        │                             (referral passed so the referrer gets credit)
+        ├─ plain t.me/<id> ending in "bot" → sendMessage(bot,"/start")  entity=bot
+        │     (bots must be /start-ed; JoinChannel on a bot → InputPeerUser cast error)
         ├─ plain t.me/<id>          → joinChannel(id)   entity=channel
         └─ unknown                  → simulate visit (sleep)  entity=unknown
         │
@@ -496,8 +499,11 @@ handleSponsor(sponsorMsg):  up to 3 attempts
   ├─ collect action buttons (with .url) + verify button ("Я выполнил"/"Проверить")
   ├─ for each action button:
   │     resolveUrl → botMatch(?start=) → /start bot
+  │                 → startapp (checked BEFORE generic t.me — TG_ANY_LINK matches
+  │                   everything) → join patrickgames_news / webapp bot gets
+  │                   "/start <startapp param>" (referral credited, webapp never opened)
+  │                 → bare t.me/<name> ending in "bot" → /start bot (not a channel)
   │                 → channelMatch      → joinChannel
-  │                 → startapp          → join patrickgames_news / webapp /start
   │     (CHANNELS_TOO_MUCH → notify admin)
   ├─ click verify → popup
   │     "Подпишись на все каналы" → RequestAppWebView fallback per webapp → retry loop

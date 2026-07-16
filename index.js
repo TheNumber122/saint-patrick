@@ -228,6 +228,12 @@ const TG_BOT_START = /(?:t|telegram)\.me\/([^?/]+)\?start=(.+)/;
 const TG_ANY_LINK  = /(?:t|telegram)\.me\/(.+)/;
 const TG_USERNAME  = /(?:t|telegram)\.me\/([^/?]+)/;
 const isTelegramUrl = (u) => /(?:t|telegram)\.me\//.test(u);
+// startapp URL = webapp link. We never open webapps — /start the bot directly,
+// passing the startapp value as the referral so the referrer still gets credit.
+const getStartappParam = (u) => u.match(/[?&]startapp=?([^&\s]*)/)?.[1] || null;
+// Telegram requires all bot usernames to end in "bot" — bare t.me links to
+// bots must be /start-ed, not joined (JoinChannel on a bot → InputPeerUser cast error).
+const isBotUsername = (name) => /bot$/i.test(name || "");
 
 // ============================================
 // SAVED LINKS — redirector URLs (go.botohub.me etc.)
@@ -470,7 +476,13 @@ async function handleSponsor(client, sponsorMsg) {
 
       try {
         const botMatch = url.match(TG_BOT_START);
-        const channelMatch = !botMatch && url.match(TG_ANY_LINK);
+        // startapp must be classified BEFORE the generic t.me match — TG_ANY_LINK
+        // matches every t.me URL, so checking it first sent webapp links like
+        // t.me/Bot/app?startapp=X into joinChannel ("Cannot find any entity").
+        const startappParam = getStartappParam(url);
+        const isWebapp = !botMatch && url.includes("startapp");
+        const username = url.match(TG_USERNAME)?.[1];
+        const channelMatch = !botMatch && !isWebapp && url.match(TG_ANY_LINK);
         // URL saved in the dashboard → execute its bot/channel destination.
         const saved = await getSavedLink(url);
 
@@ -487,26 +499,37 @@ async function handleSponsor(client, sponsorMsg) {
             });
           });
           await sleep(3000 + Math.random() * 2000);
+        } else if (isWebapp) {
+          if (url.includes("patrickgamesbot")) {
+            await withCaptcha(client, async () => {
+              await joinChannel(client, "patrickgames_news", "SPONSOR");
+            });
+          } else if (username) {
+            // Webapp link — never open the webapp; /start the bot with the
+            // startapp value as referral so the referrer still gets credit.
+            console.log(
+              `[SPONSOR] Webapp /start @${username}${startappParam ? ` ref=${startappParam}` : ""}`,
+            );
+            await withCaptcha(client, async () => {
+              await client.sendMessage(username, {
+                message: startappParam ? `/start ${startappParam}` : "/start",
+              });
+            });
+            await sleep(3000 + Math.random() * 2000);
+          }
+        } else if (channelMatch && isBotUsername(username)) {
+          // Bare bot link (t.me/somebot, no params) — it's a bot, not a
+          // channel; joining throws "Cannot cast InputPeerUser to InputChannel".
+          console.log(`[SPONSOR] Bare bot link — /start @${username}`);
+          await withCaptcha(client, async () => {
+            await client.sendMessage(username, { message: "/start" });
+          });
+          await sleep(3000 + Math.random() * 2000);
         } else if (channelMatch) {
           const id = channelMatch[1].split("?")[0];
           await withCaptcha(client, async () => {
             await joinChannel(client, id, "SPONSOR");
           });
-        } else if (url.includes("startapp")) {
-          if (url.includes("patrickgamesbot")) {
-            await withCaptcha(client, async () => {
-              await joinChannel(client, "patrickgames_news", "SPONSOR");
-            });
-          } else {
-            const bot = url.match(TG_USERNAME)?.[1];
-            if (bot) {
-              console.log(`[SPONSOR] Webapp /start @${bot}`);
-              await withCaptcha(client, async () => {
-                await client.sendMessage(bot, { message: "/start" });
-              });
-              await sleep(3000 + Math.random() * 2000);
-            }
-          }
         } else {
           console.log(`[SPONSOR] Unknown URL — simulating visit`);
           await sleep(4000 + Math.random() * 3000);
@@ -795,10 +818,15 @@ async function handleTasks(client, userId) {
       } else {
         const bot = url.match(/(?:t|telegram)\.me\/([^/?]+)/)?.[1];
         if (bot) {
-          console.log(`[TASK] Webapp /start @${bot}`);
+          // Webapp link — never open the webapp; /start the bot with the
+          // startapp value as referral so the referrer still gets credit.
+          const ref = getStartappParam(url);
+          console.log(`[TASK] Webapp /start @${bot}${ref ? ` ref=${ref}` : ""}`);
           try {
             await withCaptcha(client, async () => {
-              await client.sendMessage(bot, { message: "/start" });
+              await client.sendMessage(bot, {
+                message: ref ? `/start ${ref}` : "/start",
+              });
             });
             // Generous settle time — starting the bot (not the webapp) needs
             // to register on the task-checker's side before we hit verify.
@@ -813,11 +841,26 @@ async function handleTasks(client, userId) {
       const m = url.match(/(?:t|telegram)\.me\/(.+)/);
       if (m) {
         const id = m[1].split("?")[0];
-        console.log(`[TASK] Channel: ${id}`);
-        await withCaptcha(client, async () => {
-          const r = await joinChannel(client, id, "TASK");
-          if (r !== "failed") entity = { type: "channel" };
-        });
+        if (isBotUsername(id)) {
+          // Bare bot link (t.me/somebot) — it's a bot, not a channel; joining
+          // throws "Cannot cast InputPeerUser to InputChannel". /start instead.
+          console.log(`[TASK] Bare bot link — /start @${id}`);
+          try {
+            await withCaptcha(client, async () => {
+              await client.sendMessage(id, { message: "/start" });
+            });
+            await sleep(3000 + Math.random() * 2000);
+            entity = { type: "bot" };
+          } catch (e) {
+            console.log(`[TASK] Start @${id} failed: ${e.message}`);
+          }
+        } else {
+          console.log(`[TASK] Channel: ${id}`);
+          await withCaptcha(client, async () => {
+            const r = await joinChannel(client, id, "TASK");
+            if (r !== "failed") entity = { type: "channel" };
+          });
+        }
       } else {
         console.log(`[TASK] Unknown URL — simulating visit`);
         await sleep(4000 + Math.random() * 3000);
