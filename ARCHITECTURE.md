@@ -258,7 +258,8 @@ buttons, and answering callbacks** (`GetBotCallbackAnswer`) rather than clicking
 Shared helpers:
 
 - `ensureMenu()` — guarantees the main menu ("Получи свою личную ссылку") is on screen;
-  sends `/start` if needed, resolves any blocking **sponsor** screen, throws `MENU_NOT_FOUND`.
+  sends `/start` if needed, polls up to ~9s for the menu (handles stickers/slow bot),
+  resolves any blocking **sponsor** screen, throws `MENU_NOT_FOUND`.
 - `findButton(msg, textPart)` — locate an inline button by partial text.
 - `getCallbackAnswer()` — safe callback click; swallows `MESSAGE_ID_INVALID` → `"MESSAGE_EXPIRED"`.
 - `solveCaptcha()` / `withCaptcha(action)` — see §3.5.
@@ -685,8 +686,8 @@ processPendingPromos() detail:
 | `PROMO_CONCURRENCY` | 15 | rolling-pool size (max sessions in flight per promo sweep) |
 | `promoInFlight` | (runtime) | live in-flight counter, logged per account to verify concurrency |
 | `jitter()` | 4–6 s | human-like click delay |
-| stagger (first pool fill) | idx × 400 ms | de-lockstep initial connects (↓ FLOOD_WAIT) |
-| connect / promo timeouts | 60 s / 180 s | `withTimeout` ceilings |
+| stagger (first pool fill) | idx × 200 ms | de-lockstep initial connects (↓ FLOOD_WAIT) |
+| connect / promo timeouts | 20 s / 75 s | `withTimeout` ceilings |
 
 ---
 

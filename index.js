@@ -317,10 +317,12 @@ function taskVerdict(popup) {
 // CAPTCHA
 // ============================================
 async function solveCaptcha(client) {
-  const msgs = await client.getMessages(BOT, { limit: 5 });
+  const msgs = await client.getMessages(BOT, { limit: 10 });
   const captcha = msgs.find((m) => m.text?.includes("ПРОВЕРКА НА РОБОТА"));
   if (!captcha) return false;
   console.log("[CAPTCHA] Detected!");
+
+  const lowerText = captcha.text.toLowerCase();
 
   // Math captcha
   const math = captcha.text.match(/(\d+)\s*([\+\-\*\/])\s*(\d+)/);
@@ -353,12 +355,12 @@ async function solveCaptcha(client) {
     Помидор: "🍅",
   };
   for (const [name, emoji] of Object.entries(fruits)) {
-    if (captcha.text.includes(name)) {
+    if (lowerText.includes(name.toLowerCase())) {
       console.log(`[CAPTCHA] Fruit: ${name} = ${emoji}`);
       await sleep(3000 + Math.random() * 3000);
       for (const row of captcha.replyMarkup.rows)
         for (const btn of row.buttons)
-          if (btn.text === emoji) {
+          if (btn.text?.includes(emoji)) {
             await getCallbackAnswer(client, captcha, btn.data);
             console.log("[CAPTCHA] Solved ✅");
             await sleep(2000);
@@ -387,12 +389,17 @@ async function ensureMenu(client, { skipSponsor = false } = {}) {
   if (!menu) {
     await withCaptcha(client, async () => {
       await client.sendMessage(BOT, { message: "/start" });
-      await sleep(4000);
     });
-    msgs = await client.getMessages(BOT, { limit: 5 });
-    menu = msgs.find(
-      (m) => m.text?.includes("Получи свою личную ссылку") && m.replyMarkup,
-    );
+    // Poll for menu instead of fixed 4s wait — returns as soon as it appears.
+    for (let i = 0; i < 6; i++) {
+      await sleep(1500);
+      msgs = await client.getMessages(BOT, { limit: 5 });
+      menu = msgs.find(
+        (m) => m.text?.includes("Получи свою личную ссылку") && m.replyMarkup,
+      );
+      if (menu) break;
+      await solveCaptcha(client);
+    }
   }
 
   // Check for blocking sponsor screens
@@ -403,27 +410,33 @@ async function ensureMenu(client, { skipSponsor = false } = {}) {
       m.replyMarkup,
   );
   if (sponsorMsg) {
-    // Promo path: a sponsor screen means this account can't claim NOW.
-    // Resolving one costs 40–120s of a pool seat while the code is dying —
-    // skip the account instead (recorded as gated), same as task-gated promos.
     if (skipSponsor) throw new Error("SPONSOR_GATED");
     console.log(`[SPONSOR] Blocking screen — resolving...`);
     const resolved = await handleSponsor(client, sponsorMsg);
     if (!resolved) throw new Error("SPONSOR_UNRESOLVABLE");
-    await sleep(5000);
-    msgs = await client.getMessages(BOT, { limit: 5 });
-    menu = msgs.find(
-      (m) => m.text?.includes("Получи свою личную ссылку") && m.replyMarkup,
-    );
-    if (!menu) {
-      await withCaptcha(client, async () => {
-        await client.sendMessage(BOT, { message: "/start" });
-        await sleep(4000);
-      });
+    // Poll for menu after sponsor resolution
+    for (let i = 0; i < 5; i++) {
+      await sleep(1500);
       msgs = await client.getMessages(BOT, { limit: 5 });
       menu = msgs.find(
         (m) => m.text?.includes("Получи свою личную ссылку") && m.replyMarkup,
       );
+      if (menu) break;
+      await solveCaptcha(client);
+    }
+    if (!menu) {
+      await withCaptcha(client, async () => {
+        await client.sendMessage(BOT, { message: "/start" });
+      });
+      for (let i = 0; i < 4; i++) {
+        await sleep(1500);
+        msgs = await client.getMessages(BOT, { limit: 5 });
+        menu = msgs.find(
+          (m) => m.text?.includes("Получи свою личную ссылку") && m.replyMarkup,
+        );
+        if (menu) break;
+        await solveCaptcha(client);
+      }
     }
   }
 
@@ -1342,13 +1355,18 @@ function isPromoGated(text) {
 // Anchoring on `sinceId` (the id of the message we just sent) prevents a fast
 // poll from returning a stale pre-existing message.
 // ============================================
-async function waitForBotReply(client, sinceId, { capMs = 9000, stepMs = 350 } = {}) {
+async function waitForBotReply(client, sinceId, { capMs = 15000, stepMs = 350 } = {}) {
   const deadline = Date.now() + capMs;
   let msgs = [];
   while (Date.now() < deadline) {
     msgs = await client.getMessages(BOT, { limit: 5 });
     const reply = msgs.find(
-      (m) => !m.out && m.text && (!sinceId || m.id > sinceId),
+      (m) =>
+        !m.out &&
+        m.text &&
+        (!sinceId || m.id > sinceId) &&
+        // Skip intermediate "checking" messages — the real result follows.
+        !m.text.includes("Проверяем"),
     );
     if (reply) return { reply, msgs };
     await sleep(stepMs);
@@ -1384,8 +1402,6 @@ async function doPromo(client, userId, code) {
 }
 
 async function _doPromoAttempt(client, userId, code) {
-  await sleep(1000);
-
   let menu;
   try {
     menu = await ensureMenu(client, { skipSponsor: true });
@@ -1411,9 +1427,9 @@ async function _doPromoAttempt(client, userId, code) {
     try { await menu.click({ text: "👤 Профиль" }); } catch (_) {}
   }
 
-  await sleep(1500);
+  await sleep(1000);
   await solveCaptcha(client);
-  await sleep(800);
+  await sleep(500);
 
   // Step 2: Re-fetch fresh profile page — higher limit for reliability
   let msgs = await client.getMessages(BOT, { limit: 10 });
@@ -1435,7 +1451,7 @@ async function _doPromoAttempt(client, userId, code) {
     return "PROMO_BTN_NOT_FOUND";
   }
 
-  await sleep(500 + Math.random() * 500);
+  await sleep(300 + Math.random() * 300);
   const btnPopup = await getCallbackAnswer(client, profile, promoBtn.data);
   console.log(`[PROMO] Btn popup: ${btnPopup || "none"}`);
 
@@ -1447,11 +1463,11 @@ async function _doPromoAttempt(client, userId, code) {
   }
 
   // Captcha may appear after promo button click
-  await sleep(1200);
+  await sleep(800);
   await solveCaptcha(client);
 
   // Step 4: Send the code
-  await sleep(800 + Math.random() * 400);
+  await sleep(500);
   const sent = await client.sendMessage(BOT, { message: code });
   console.log(`[PROMO] Sent: "${code}"`);
 
@@ -1573,7 +1589,7 @@ async function processPendingPromos() {
 
       // Stagger connects across the batch so 15 clients don't hit the same bot
       // in lockstep (reduces FLOOD_WAIT and connect contention).
-      if (idx > 0) await sleep(idx * 400);
+      if (idx > 0) await sleep(idx * 200);
       if (exhaustedFlag) return;
 
       // Session-safety: never let /trigger and /promo connect the same session
