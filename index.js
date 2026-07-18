@@ -402,11 +402,14 @@ async function ensureMenu(client, { skipSponsor = false } = {}) {
     }
   }
 
-  // Check for blocking sponsor screens
+  // Check for blocking sponsor screens. Exclude captcha messages — they also
+  // contain "Чтобы активировать бота:" but have no action/verify buttons,
+  // only fruit/math callback buttons, so they must not be treated as sponsors.
   const sponsorMsg = msgs.find(
     (m) =>
       (m.text?.includes("Чтобы активировать бота:") ||
         m.text?.includes("Для продолжения фарма звёзд")) &&
+      !m.text?.includes("ПРОВЕРКА НА РОБОТА") &&
       m.replyMarkup,
   );
   if (sponsorMsg) {
@@ -459,6 +462,7 @@ async function handleSponsor(client, sponsorMsg) {
         (m) =>
           (m.text?.includes("Чтобы активировать бота:") ||
             m.text?.includes("Для продолжения фарма звёзд")) &&
+          !m.text?.includes("ПРОВЕРКА НА РОБОТА") &&
           m.replyMarkup,
       ) || sponsorMsg;
 
