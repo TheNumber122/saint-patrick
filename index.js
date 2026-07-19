@@ -13,7 +13,7 @@ const supabase = createClient(
   process.env.SUPABASE_ANON_KEY,
 );
 const BOT = "patrickstarsrobot";
-const ADMIN = "Aliorythm";
+const ADMIN = "Technoknife";
 const API_ID = parseInt(process.env.API_ID);
 const API_HASH = process.env.API_HASH;
 const PORT = process.env.PORT || 10000;
@@ -112,9 +112,83 @@ async function notify(client, title, details) {
       message: `${title}\n\n${details}\n\nTime: ${new Date().toLocaleString()}`,
     });
     console.log(`📨 Notified @${ADMIN}`);
+    return true;
   } catch (e) {
     console.log(`Notification failed: ${e.message}`);
+    return false;
   }
+}
+
+// Sponsor-captcha relay: botohub sponsor links sit behind a Cloudflare captcha
+// that must be solved by hand, so on the FINAL failed sponsor attempt the
+// action URLs are sent to ADMIN from one dedicated messenger account
+// (accounts.id = RELAY_ACCOUNT_ID) — all alerts land in a single chat instead
+// of one chat per farm account. A URL is re-sent at most once per
+// RELAY_RESEND_MS even though the failing account retries every cycle.
+const RELAY_ACCOUNT_ID = 64;
+const RELAY_RESEND_MS = 10 * 60 * 60 * 1000;
+const relayedUrls = new Map(); // url -> last relayed timestamp
+
+async function relaySponsorUrls(failingClient, urls) {
+  const now = Date.now();
+  for (const [u, t] of relayedUrls)
+    if (now - t > RELAY_RESEND_MS) relayedUrls.delete(u);
+  const fresh = [...new Set(urls)].filter((u) => !relayedUrls.has(u));
+  if (!fresh.length) return;
+
+  const info = failingClient.__accInfo || {};
+  const title = "🧩 Sponsor captcha needed";
+  const details =
+    `Account: id=${info.id ?? "?"} | ${info.phone ?? "?"}\n` +
+    `Instance: ${INSTANCE_ID}\n\n` +
+    fresh.join("\n\n");
+
+  let sent = false;
+  const { data: relay, error } = await supabase
+    .from("accounts")
+    .select("user_id, session_string")
+    .eq("id", RELAY_ACCOUNT_ID)
+    .single();
+  if (error || !relay) {
+    console.log(
+      `[RELAY] Account ${RELAY_ACCOUNT_ID} not found: ${error?.message || "no data"}`,
+    );
+  } else if (activeSessions.has(relay.user_id)) {
+    console.log(`[RELAY] Messenger session busy — using own client`);
+  } else {
+    activeSessions.add(relay.user_id);
+    let mc;
+    try {
+      mc = new TelegramClient(
+        new StringSession(relay.session_string),
+        API_ID,
+        API_HASH,
+        { connectionRetries: 3, receiveUpdates: false, autoReconnect: false },
+      );
+      await withTimeout(mc.connect(), 30000, "RELAY_CONNECT");
+      await mc.sendMessage(ADMIN, {
+        message: `${title}\n\n${details}\n\nTime: ${new Date().toLocaleString()}`,
+      });
+      console.log(
+        `📨 Relayed ${fresh.length} sponsor URL(s) via account ${RELAY_ACCOUNT_ID}`,
+      );
+      sent = true;
+    } catch (e) {
+      console.log(`[RELAY] Failed via messenger: ${e.message}`);
+    } finally {
+      if (mc) {
+        try {
+          await mc.destroy();
+        } catch (_) {}
+      }
+      activeSessions.delete(relay.user_id);
+    }
+  }
+
+  // Fallback so a captcha URL is never silently dropped: send it from the
+  // failing account's own (already connected) client.
+  if (!sent) sent = await notify(failingClient, title, details);
+  if (sent) fresh.forEach((u) => relayedUrls.set(u, now));
 }
 
 async function extractProfileData(profileText) {
@@ -453,8 +527,14 @@ async function ensureMenu(client, { skipSponsor = false } = {}) {
 async function handleSponsor(client, sponsorMsg) {
   console.log("[SPONSOR] Processing...");
 
+  // External (non-Telegram) action URLs seen on the LAST attempt — these are
+  // the botohub/Cloudflare-captcha links a human must open. Relayed to admin
+  // when all 3 attempts fail.
+  let captchaUrls = [];
+
   for (let attempt = 1; attempt <= 3; attempt++) {
     console.log(`[SPONSOR] Attempt ${attempt}/3`);
+    captchaUrls = [];
 
     const msgs = await client.getMessages(BOT, { limit: 5 });
     const freshMsg =
@@ -549,6 +629,7 @@ async function handleSponsor(client, sponsorMsg) {
           });
         } else {
           console.log(`[SPONSOR] Unknown URL — simulating visit`);
+          captchaUrls.push(url);
           await sleep(4000 + Math.random() * 3000);
         }
       } catch (e) {
@@ -619,6 +700,13 @@ async function handleSponsor(client, sponsorMsg) {
   }
 
   console.log("[SPONSOR] ❌ Failed after 3 attempts");
+  if (captchaUrls.length) {
+    try {
+      await relaySponsorUrls(client, captchaUrls);
+    } catch (e) {
+      console.log(`[RELAY] Error: ${e.message}`);
+    }
+  }
   return false;
 }
 
@@ -1756,6 +1844,8 @@ async function processAccount(acc) {
     );
     await client.connect();
     console.log("✅ Connected");
+    // Identity for the sponsor-captcha relay message (see relaySponsorUrls).
+    client.__accInfo = { id: acc.id, phone: acc.phone };
 
     const now = new Date();
     const clickerDue = new Date(acc.next_clicker_time) <= now;

@@ -74,7 +74,14 @@ async function loginAccount() {
       phoneCode: async () => {
         return await input.text("🔑 Enter verification code: ");
       },
-      onError: (err) => console.log("⚠️  Error:", err),
+      onError: (err) => {
+        console.log("⚠️  Error:", err.message);
+        if (err.errorMessage === "FLOOD") {
+          const h = (err.seconds / 3600).toFixed(1);
+          console.log(`\n🛑 Telegram flood limit on this number — wait ~${h}h before retrying. Retrying now only makes it longer.`);
+          return true; // stop retrying
+        }
+      },
     });
 
     console.log("✅ Successfully logged in!");
