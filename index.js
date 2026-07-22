@@ -356,6 +356,23 @@ async function getSavedLink(url) {
   const exact = savedLinks.find((l) => l.url === url);
   if (exact) return exact;
 
+  // tgrass tracking URLs: match by tb_id (task identifier), ignoring tg_user_id
+  // which varies per account. Different tb_id = different destination.
+  if (url.includes("api-tgrass.space/track")) {
+    const incomingTb = new URL(url).searchParams.get("tb_id");
+    if (incomingTb) {
+      const matches = savedLinks.filter((l) => {
+        if (!l.url.includes("api-tgrass.space/track")) return false;
+        try { return new URL(l.url).searchParams.get("tb_id") === incomingTb; }
+        catch { return false; }
+      });
+      if (matches.length === 1) return matches[0];
+      if (matches.length > 1)
+        console.log("[LINK] Ambiguous tgrass — multiple saved links with same tb_id, skipping");
+    }
+    return null;
+  }
+
   const matches = savedLinks.filter(
     (l) => prefixRatio(url, l.url) >= (l.twin ? LINK_STRICT : LINK_LOOSE),
   );
