@@ -106,12 +106,12 @@ async function incrementError(userId, errMsg) {
   }
 }
 
-async function notify(client, title, details) {
+async function notify(client, title, details, to = ADMIN) {
   try {
-    await client.sendMessage(ADMIN, {
+    await client.sendMessage(to, {
       message: `${title}\n\n${details}\n\nTime: ${new Date().toLocaleString()}`,
     });
-    console.log(`📨 Notified @${ADMIN}`);
+    console.log(`📨 Notified @${to}`);
     return true;
   } catch (e) {
     console.log(`Notification failed: ${e.message}`);
@@ -126,23 +126,13 @@ async function notify(client, title, details) {
 // of one chat per farm account. A URL is re-sent at most once per
 // RELAY_RESEND_MS even though the failing account retries every cycle.
 const RELAY_ACCOUNT_ID = 64;
+const RELAY_TO = "Aliorythm"; // sponsor-captcha links go here, not ADMIN
 const RELAY_RESEND_MS = 10 * 60 * 60 * 1000;
 const relayedUrls = new Map(); // url -> last relayed timestamp
 
-async function relaySponsorUrls(failingClient, urls) {
-  const now = Date.now();
-  for (const [u, t] of relayedUrls)
-    if (now - t > RELAY_RESEND_MS) relayedUrls.delete(u);
-  const fresh = [...new Set(urls)].filter((u) => !relayedUrls.has(u));
-  if (!fresh.length) return;
-
-  const info = failingClient.__accInfo || {};
-  const title = "🧩 Sponsor captcha needed";
-  const details =
-    `Account: id=${info.id ?? "?"} | ${info.phone ?? "?"}\n` +
-    `Instance: ${INSTANCE_ID}\n\n` +
-    fresh.join("\n\n");
-
+// Send a message to RELAY_TO via the dedicated relay account, falling back to
+// the given (already connected) client so the alert is never silently dropped.
+async function sendViaRelay(fallbackClient, title, details) {
   let sent = false;
   const { data: relay, error } = await supabase
     .from("accounts")
@@ -166,11 +156,11 @@ async function relaySponsorUrls(failingClient, urls) {
         { connectionRetries: 3, receiveUpdates: false, autoReconnect: false },
       );
       await withTimeout(mc.connect(), 30000, "RELAY_CONNECT");
-      await mc.sendMessage(ADMIN, {
+      await mc.sendMessage(RELAY_TO, {
         message: `${title}\n\n${details}\n\nTime: ${new Date().toLocaleString()}`,
       });
       console.log(
-        `📨 Relayed ${fresh.length} sponsor URL(s) via account ${RELAY_ACCOUNT_ID}`,
+        `📨 Relayed via account ${RELAY_ACCOUNT_ID} → @${RELAY_TO}`,
       );
       sent = true;
     } catch (e) {
@@ -184,11 +174,58 @@ async function relaySponsorUrls(failingClient, urls) {
       activeSessions.delete(relay.user_id);
     }
   }
+  if (!sent) sent = await notify(fallbackClient, title, details, RELAY_TO);
+  return sent;
+}
 
-  // Fallback so a captcha URL is never silently dropped: send it from the
-  // failing account's own (already connected) client.
-  if (!sent) sent = await notify(failingClient, title, details);
+async function relaySponsorUrls(failingClient, urls) {
+  const now = Date.now();
+  for (const [u, t] of relayedUrls)
+    if (now - t > RELAY_RESEND_MS) relayedUrls.delete(u);
+  const fresh = [...new Set(urls)].filter((u) => !relayedUrls.has(u));
+  if (!fresh.length) return;
+
+  const info = failingClient.__accInfo || {};
+  const sent = await sendViaRelay(
+    failingClient,
+    "🧩 Sponsor captcha needed",
+    `Account: id=${info.id ?? "?"} | ${info.phone ?? "?"}\n` +
+      `Instance: ${INSTANCE_ID}\n\n` +
+      fresh.join("\n\n"),
+  );
   if (sent) fresh.forEach((u) => relayedUrls.set(u, now));
+}
+
+// PANIC MODE: the bot sent a captcha-ban message to one of our accounts — the
+// farm is being detected. Disable ALL accounts across ALL instances at once
+// and alert RELAY_TO. Other instances stop on their next sweep (they fetch
+// only is_active=true). Only messages <1h old trigger this, so an old ban
+// sitting in a manually re-enabled account's history can't re-fire it.
+const BAN_RE = /забанен(?:ы)? за \d+ неверн/i;
+const BAN_MAX_AGE_S = 3600;
+let panicActive = false;
+
+async function triggerPanic(client, banText) {
+  if (panicActive) return;
+  panicActive = true;
+  const info = client.__accInfo || {};
+  console.log(
+    `🚨 [PANIC] Ban message on ${info.phone ?? "?"} — disabling ALL accounts`,
+  );
+  const { error } = await supabase
+    .from("accounts")
+    .update({ is_active: false })
+    .eq("is_active", true);
+  if (error) console.log(`[PANIC] ❌ DB disable FAILED: ${error.message}`);
+  else console.log(`[PANIC] ✅ All accounts disabled`);
+  await sendViaRelay(
+    client,
+    "🚨 PANIC — captcha ban detected, ALL accounts disabled",
+    `Detected on: id=${info.id ?? "?"} | ${info.phone ?? "?"}\n` +
+      `Instance: ${INSTANCE_ID}\n` +
+      (error ? `⚠️ DB DISABLE FAILED: ${error.message}\n` : "") +
+      `\n${banText}`,
+  );
 }
 
 async function extractProfileData(profileText) {
@@ -409,6 +446,16 @@ function taskVerdict(popup) {
 // ============================================
 async function solveCaptcha(client) {
   const msgs = await client.getMessages(BOT, { limit: 10 });
+
+  // PANIC: captcha-ban message → kill the whole farm (see triggerPanic)
+  const ban = msgs.find(
+    (m) => m.text && BAN_RE.test(m.text) && Date.now() / 1000 - m.date < BAN_MAX_AGE_S,
+  );
+  if (ban) {
+    await triggerPanic(client, ban.text.split("\n")[0]);
+    throw new Error("PANIC_BAN");
+  }
+
   const captcha = msgs.find((m) => m.text?.includes("ПРОВЕРКА НА РОБОТА"));
   if (!captcha) return false;
   console.log("[CAPTCHA] Detected!");
@@ -1788,7 +1835,7 @@ async function processPendingPromos() {
 
     async function runNext() {
       while (true) {
-        if (exhaustedFlag) return;
+        if (exhaustedFlag || panicActive) return;
         const i = cursor++;
         if (i >= pending.length) return;
 
@@ -1880,6 +1927,7 @@ async function processAccount(acc) {
         await doClicker(client, acc.user_id);
       } catch (e) {
         console.error(`[CLICKER] ❌ ${e.message}`);
+        if (e.message === "PANIC_BAN") return; // panic already disabled + notified
         if (e.message === "CHANNELS_TOO_MUCH") {
           await notify(
             client,
@@ -1937,6 +1985,7 @@ async function processAccount(acc) {
         await doDaily(client, acc.user_id);
       } catch (e) {
         console.error(`[DAILY] ❌ ${e.message}`);
+        if (e.message === "PANIC_BAN") return; // panic already disabled + notified
         const transient = [
           "SPONSOR_UNRESOLVABLE",
           "MENU_NOT_FOUND",
@@ -2009,6 +2058,7 @@ async function runTrigger() {
   const remaining = accounts.filter((a) => !promoProcessed.has(a.user_id));
   console.log(`📋 ${accounts.length} due, ${remaining.length} after promo filter`);
   for (const acc of remaining) {
+    if (panicActive) { console.log("🚨 [PANIC] Sweep aborted"); break; }
     await processAccount(acc);
     await sleep(1000 + Math.random() * 2000);
   }
