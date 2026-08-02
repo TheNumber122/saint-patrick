@@ -346,6 +346,18 @@ const getStartappParam = (u) => u.match(/[?&]startapp=?([^&\s]*)/)?.[1] || null;
 // bots must be /start-ed, not joined (JoinChannel on a bot → InputPeerUser cast error).
 const isBotUsername = (name) => /bot$/i.test(name || "");
 
+// Start a bot the way a real deep-link click does. Clicking t.me/bot?start=X
+// sends messages.StartBot with the param in the API call — the chat shows a
+// bare "/start". Sending literal "/start X" text is NOT the same: many bots
+// only read the param from StartBot, so the referral was silently dropped.
+async function startBot(client, username, param) {
+  if (!param) return client.sendMessage(username, { message: "/start" });
+  const peer = await client.getInputEntity(username);
+  await client.invoke(
+    new Api.messages.StartBot({ bot: peer, peer, startParam: param }),
+  );
+}
+
 // ============================================
 // SAVED LINKS — redirector URLs (go.botohub.me etc.)
 // Captcha-gated redirectors a TG client can't follow. You save
@@ -427,7 +439,7 @@ async function executeSavedLink(client, link, tag) {
   }
   const [bot, param] = link.dest_value.replace(/^@/, "").split("?start=");
   console.log(`[${tag}] Saved link → bot @${bot}${param ? ` start=${param}` : ""}`);
-  await client.sendMessage(bot, { message: param ? `/start ${param}` : "/start" });
+  await startBot(client, bot, param);
   return true;
 }
 
@@ -655,9 +667,7 @@ async function handleSponsor(client, sponsorMsg) {
         } else if (botMatch) {
           console.log(`[SPONSOR] Starting bot @${botMatch[1]}`);
           await withCaptcha(client, async () => {
-            await client.sendMessage(botMatch[1], {
-              message: `/start ${botMatch[2]}`,
-            });
+            await startBot(client, botMatch[1], botMatch[2]);
           });
           await sleep(3000 + Math.random() * 2000);
         } else if (isWebapp) {
@@ -672,9 +682,7 @@ async function handleSponsor(client, sponsorMsg) {
               `[SPONSOR] Webapp /start @${username}${startappParam ? ` ref=${startappParam}` : ""}`,
             );
             await withCaptcha(client, async () => {
-              await client.sendMessage(username, {
-                message: startappParam ? `/start ${startappParam}` : "/start",
-              });
+              await startBot(client, username, startappParam);
             });
             await sleep(3000 + Math.random() * 2000);
           }
@@ -967,7 +975,7 @@ async function handleTasks(client, userId) {
         console.log(`[TASK] Bot: @${m[1]}`);
         await withCaptcha(client, async () => {
           await sleep(2000);
-          await client.sendMessage(m[1], { message: `/start ${m[2]}` });
+          await startBot(client, m[1], m[2]);
         });
         entity = { type: "bot" };
       }
@@ -993,9 +1001,7 @@ async function handleTasks(client, userId) {
           console.log(`[TASK] Webapp /start @${bot}${ref ? ` ref=${ref}` : ""}`);
           try {
             await withCaptcha(client, async () => {
-              await client.sendMessage(bot, {
-                message: ref ? `/start ${ref}` : "/start",
-              });
+              await startBot(client, bot, ref);
             });
             // Generous settle time — starting the bot (not the webapp) needs
             // to register on the task-checker's side before we hit verify.
