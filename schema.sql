@@ -348,7 +348,10 @@ GRANT USAGE  ON SEQUENCE balances_id_seq TO service_role;
   );
 
   alter table protected_channels enable row level security;
-  grant all privileges on table protected_channels to service_role;
+  -- The worker currently reads with SUPABASE_ANON_KEY, and Telegap may use
+  -- either the sister project's service-role key or its legacy anon key.
+  -- RLS policies do not grant SQL table privileges, so grant them explicitly.
+  grant select, insert, update on table protected_channels to anon, authenticated, service_role;
   create policy "Allow full access to protected_channels"
     on protected_channels for all using (true) with check (true);
 

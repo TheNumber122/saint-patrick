@@ -10,7 +10,7 @@ const express = require("express");
 const INSTANCE_ID = parseInt(process.env.INSTANCE_ID);
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY,
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY,
 );
 const BOT = "patrickstarsrobot";
 const ADMIN = "Technoknife";
@@ -785,6 +785,19 @@ async function handleSponsor(client, sponsorMsg) {
 // ============================================
 // LEAVE CHANNELS
 // ============================================
+// Keep the worker tolerant of older Telegap rows written with mtcute's marked
+// channel id (-1000000000000 - bare id). New rows are written bare, but this
+// lets the repair/backfill path protect rows created before the normalization.
+function toBareChannelId(channelId) {
+  try {
+    const id = BigInt(String(channelId));
+    const channelMark = BigInt("-1000000000000");
+    return (id < channelMark ? channelMark - id : id).toString();
+  } catch (_) {
+    return String(channelId);
+  }
+}
+
 async function leaveChannels(client, userId) {
   console.log("[LEAVE] Starting cleanup...");
   let dialogs;
@@ -806,9 +819,11 @@ async function leaveChannels(client, userId) {
       const { data, error } = await supabase
         .from("protected_channels")
         .select("channel_id")
+        .order("channel_id", { ascending: true })
         .range(from, from + 999);
       if (error) throw error;
-      for (const r of data || []) protectedIds.add(String(r.channel_id));
+      for (const r of data || [])
+        protectedIds.add(toBareChannelId(r.channel_id));
       if (!data || data.length < 1000) break;
     }
     console.log(`[LEAVE] ${protectedIds.size} protected channel(s) loaded`);
@@ -823,7 +838,7 @@ async function leaveChannels(client, userId) {
       d.entity?.broadcast === true &&
       d.entity?.megagroup !== true &&
       d.entity?.username !== "Aliorithm" &&
-      !protectedIds.has(String(d.entity.id)),
+      !protectedIds.has(toBareChannelId(d.entity.id)),
   );
   console.log(`[LEAVE] ${channels.length} broadcast channel(s)`);
 
