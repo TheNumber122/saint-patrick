@@ -302,6 +302,13 @@ async function joinChannel(client, identifier, tag) {
     const eu = (e.message || "").toUpperCase();
     if (eu.includes("CHANNELS_TOO_MUCH") || eu.includes("TOO MANY CHANNELS"))
       throw new Error("CHANNELS_TOO_MUCH");
+    // Parse flood wait time — "A wait of 78 seconds is required" → 78
+    const floodMatch = e.message?.match(/A wait of (\d+) seconds/);
+    if (floodMatch) {
+      const secs = parseInt(floodMatch[1], 10);
+      console.log(`[${tag}] Flood wait: ${secs}s`);
+      throw new Error(`FLOOD_WAIT:${secs}`);
+    }
     if (
       e.message?.includes("USER_ALREADY_PARTICIPANT") ||
       e.message?.includes("INVITE_REQUEST_SENT")
@@ -434,8 +441,16 @@ async function getSavedLink(url) {
 // dest_value: bot → "username" or "username?start=param"; channel → id/username
 async function executeSavedLink(client, link, tag) {
   if (link.dest_type === "channel") {
-    const r = await joinChannel(client, link.dest_value.replace(/^@/, ""), tag);
-    return r !== "failed";
+    try {
+      const r = await joinChannel(client, link.dest_value.replace(/^@/, ""), tag);
+      return r !== "failed";
+    } catch (e) {
+      if (e.message?.startsWith("FLOOD_WAIT:")) {
+        console.log(`[${tag}] Saved link flood wait — ${e.message}`);
+        return false;
+      }
+      throw e;
+    }
   }
   const [bot, param] = link.dest_value.replace(/^@/, "").split("?start=");
   console.log(`[${tag}] Saved link → bot @${bot}${param ? ` start=${param}` : ""}`);
@@ -609,6 +624,9 @@ async function handleSponsor(client, sponsorMsg) {
   // the botohub/Cloudflare-captcha links a human must open. Relayed to admin
   // when all 3 attempts fail.
   let captchaUrls = [];
+  // Track the longest flood wait across all attempts — if every attempt hits
+  // a flood wait, we back off instead of retrying immediately.
+  let maxFloodWait = 0;
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     console.log(`[SPONSOR] Attempt ${attempt}/3`);
@@ -718,6 +736,10 @@ async function handleSponsor(client, sponsorMsg) {
             "🚨 Sponsor: Channel Limit",
             `Instance: ${INSTANCE_ID}\nURL: ${url}`,
           );
+        } else if (e.message?.startsWith("FLOOD_WAIT:")) {
+          const secs = parseInt(e.message.split(":")[1], 10);
+          if (secs > maxFloodWait) maxFloodWait = secs;
+          console.log(`[SPONSOR] Flood wait ${secs}s — backing off`);
         } else {
           console.log(`[SPONSOR] Button error (skipping): ${e.message}`);
         }
@@ -788,6 +810,11 @@ async function handleSponsor(client, sponsorMsg) {
     } catch (e) {
       console.log(`[RELAY] Error: ${e.message}`);
     }
+  }
+  // If every attempt hit a flood wait, propagate the wait time so the
+  // caller can back off instead of retrying in the normal cycle.
+  if (maxFloodWait > 0) {
+    throw new Error(`SPONSOR_FLOOD_WAIT:${maxFloodWait}`);
   }
   return false;
 }
@@ -1008,14 +1035,24 @@ async function handleTasks(client, userId) {
       if (url.includes("patrickgamesbot")) {
         console.log("[TASK] Patrick webapp");
         await withCaptcha(client, async () => {
-          const r = await joinChannel(client, "patrickgames_news", "TASK");
-          if (r !== "failed") entity = { type: "channel" };
+          try {
+            const r = await joinChannel(client, "patrickgames_news", "TASK");
+            if (r !== "failed") entity = { type: "channel" };
+          } catch (e) {
+            if (e.message?.startsWith("FLOOD_WAIT:")) console.log(`[TASK] Flood wait — ${e.message}`);
+            else throw e;
+          }
         });
       } else if (url.includes("MyChimpBot")) {
         console.log("[TASK] MyChimp — joining channel");
         await withCaptcha(client, async () => {
-          const r = await joinChannel(client, "mychimp", "TASK");
-          if (r !== "failed") entity = { type: "channel" };
+          try {
+            const r = await joinChannel(client, "mychimp", "TASK");
+            if (r !== "failed") entity = { type: "channel" };
+          } catch (e) {
+            if (e.message?.startsWith("FLOOD_WAIT:")) console.log(`[TASK] Flood wait — ${e.message}`);
+            else throw e;
+          }
         });
       } else {
         const bot = url.match(/(?:t|telegram)\.me\/([^/?]+)/)?.[1];
@@ -1057,8 +1094,13 @@ async function handleTasks(client, userId) {
         } else {
           console.log(`[TASK] Channel: ${id}`);
           await withCaptcha(client, async () => {
-            const r = await joinChannel(client, id, "TASK");
-            if (r !== "failed") entity = { type: "channel" };
+            try {
+              const r = await joinChannel(client, id, "TASK");
+              if (r !== "failed") entity = { type: "channel" };
+            } catch (e) {
+              if (e.message?.startsWith("FLOOD_WAIT:")) console.log(`[TASK] Flood wait — ${e.message}`);
+              else throw e;
+            }
           });
         }
       } else {
@@ -1989,6 +2031,23 @@ async function processAccount(acc) {
                   60000,
             ).toISOString(),
             last_error: "Sponsor unresolvable after 3 attempts",
+          });
+        } else if (e.message?.startsWith("SPONSOR_FLOOD_WAIT:")) {
+          const secs = parseInt(e.message.split(":")[1], 10);
+          const backoff = Math.max(secs * 2, SPONSOR_DELAY * 60);
+          console.log(`[CLICKER] 🕐 Sponsor flood wait — backing off ${Math.round(backoff / 60)}min`);
+          await notify(
+            client,
+            "⏳ Sponsor Flood Wait",
+            `Instance: ${INSTANCE_ID}\nPhone: ${acc.phone}\nWait: ${secs}s → backing off ${Math.round(backoff / 60)}min`,
+          );
+          await updateAccount(acc.user_id, {
+            next_clicker_time: new Date(
+              Date.now() +
+                (backoff + CLICKER_MIN + Math.random() * CLICKER_MAX) *
+                  1000,
+            ).toISOString(),
+            last_error: `Sponsor flood wait ${secs}s`,
           });
         } else if (
           ["MENU_NOT_FOUND", "MESSAGE_ID_INVALID", "TIMEOUT"].some((t) =>

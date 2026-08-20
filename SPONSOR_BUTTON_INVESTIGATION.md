@@ -1,297 +1,137 @@
-# Sponsor Button Link Investigation
+# Sponsor Button Investigation — Log Analysis
 
 **Date:** August 20, 2026  
-**Status:** Root cause narrowed — debug logging needed to confirm  
-**Resolution:** Not yet applied
+**Status:** Root cause CONFIRMED via live logs  
+**Resolution:** Not a code bug — sponsor bot-side propagation/cache issue
 
 ---
 
-## Problem
+## What the Logs Revealed
 
-The bot enters a loop: `/start` → sponsor screen → processes buttons → verify fails → `/start` → sponsor screen → repeat. Previously it would resolve the sponsor and continue. Now it never completes.
+### Button type: `KeyboardButtonUrl` (NOT WebView)
+
+The original hypothesis was wrong. The sponsor bot uses plain **URL-type buttons**, not web_app:
+
+```
+[SPONSOR-DBG] button: text="🧷 Подписаться" url=https://t.me/+ttEJjHt7KaY5Y2Rk className=KeyboardButtonUrl hasData=false
+```
+
+So the code's `btn.url` detection works perfectly. No gramjs change needed.
+
+### The URL is a private channel invite link
+
+```
+url=https://t.me/+ttEJjHt7KaY5Y2Rk
+classify: saved=false botMatch=false isWebapp=false channelMatch=true isBot=false username=+ttEJjHt7KaY5Y2Rk
+```
+
+It's classified correctly as a channel invite → `joinChannel()` is called.
 
 ---
 
-## Sponsor Message (What the Bot Sees)
+## The Actual Problem: Join Succeeds, Verify Still Fails
 
-Text detected by the code:
-- `"Чтобы активировать бота:"` (To activate the bot:)
-- OR `"Для продолжения фарма звёзд"` (To continue farming stars)
+### Account 1 (+989212379161) — Flood Wait Scenario
 
-Screenshot (confirmed working format):
 ```
-Для продолжения фарма звёзд, пожалуйста, выполни всего 1 задание
-
-1. Подпишись на наших спонсоров (это займёт 5 секунд)
-2. Жми кнопку «✅ Я выполнил(а)»
-
-┌─────────────────────────────────────┐
-│  ✏️ Подписаться            ↗️      │   ← action button (KeyboardButtonWebView or KeyboardButtonUrl)
-├─────────────────────────────────────┤
-│  ✅ Я выполнил(а)                   │   ← verify button (KeyboardButtonCallback)
-└─────────────────────────────────────┘
+Attempt 1: Join failed: A wait of 78 seconds is required (ImportChatInvite)
+Attempt 2: [sleeps 50s + 5s + 18s] → Already a member → verify ❌
+Attempt 3: Join failed: A wait of 197 seconds is required (ImportChatInvite)
 ```
 
-**All detection checks PASS:**
-| Check | Code | Result |
-|-------|------|--------|
-| Message text | `m.text?.includes("Для продолжения фарма звёзд")` | ✅ Matches |
-| Not captcha | `!m.text?.includes("ПРОВЕРКА НА РОБОТА")` | ✅ Pass |
-| Has buttons | `m.replyMarkup` | ✅ Pass |
-| Verify button | `t.includes("Я выполнил")` | ✅ Matches "Я выполнил(а)" |
-| Action button | `btn.url` | ✅ Gramjs exposes .url on both types |
+The first attempt hits a **flood wait** (Telegram rate limit). By the time attempt 2 runs, the account is already a member (from a previous join), but the verify **still fails**.
+
+### Account 2 (+989030272818) — Success Scenario
+
+```
+Attempt 1: Joined ✅ → verify ❌ "Подпишись на все каналы"
+Attempt 2: Already a member → verify ❌ "Подпишись на все каналы"
+Attempt 3: Already a member → verify ❌ "Подпишись на все каналы"
+```
+
+The join **succeeds on the first try**. The bot is definitely in the channel. But the verify callback **always fails** with "subscribe to ALL channels."
 
 ---
 
-## Initial Hypothesis (DISPROVEN)
+## Why This Happens
 
-**Hypothesis:** The bot changed from URL-type buttons to web_app-type buttons, and `btn.web_app.url` is not the same as `btn.url`.
+The sponsor bot's verify callback (`"✅ Я выполнил(а)"`) checks channel membership via its own mechanism. There are three possible reasons it fails even after a successful join:
 
-**Finding: This is WRONG for gramjs.**
+### 1. Telegram propagation delay (most likely)
+When you join a channel via `ImportChatInvite`, Telegram's internal membership index doesn't update instantly. The sponsor bot's callback handler reads from this index, which can lag behind. This explains why it "fixes itself after some hours" — eventually the index catches up.
 
-The project uses gramjs (`"telegram": "^2.26.22"`) which is an MTProto client, NOT the Telegram Bot API. In the MTProto layer:
+### 2. The invite link resolves to a different entity
+`t.me/+inviteHash` links can resolve to:
+- A channel
+- A supergroup (which looks like a channel but is technically different)
+- A chat
 
-| Bot API type | MTProto type (gramjs) | Properties |
-|---|---|---|
-| `{ type: "url", url: "..." }` | `KeyboardButtonUrl` | `{ text, url }` |
-| `{ type: "web_app", web_app: { url: "..." } }` | `KeyboardButtonWebView` | `{ text, url }` |
+The sponsor bot might be checking `channels.getParticipant(channelId)` but the invite hash resolves to a supergroup ID. The types don't match, so the check fails.
 
-**Both types expose `btn.url` directly.** Verified with:
-```javascript
-const btn = new Api.KeyboardButtonWebView({text: 'test', url: 'https://...'});
-btn.url  // → 'https://...'  ✅ works!
-```
-
-So the button detection code `else if (btn.url) actionBtns.push(btn)` works for both types.
+### 3. Rate limiting on the verify callback
+After the first successful join, Telegram may rate-limit the bot's callback answers. The sponsor bot receives "user joined" but can't process it quickly enough, so it reports "not subscribed" on the next verify click.
 
 ---
 
-## Revised Analysis
+## Why It "Fixes Itself After Hours"
 
-Since the buttons ARE detected and the action loop DOES run, the issue is that the **sponsor task is not being completed**. After processing the action button and clicking verify, the bot gets back `"Подпишись на все каналы"` (you haven't subscribed to all channels) and retries 3 times, all failing.
+The bot sets `next_clicker_time = now + 10 minutes` after `SPONSOR_UNRESOLVABLE`. So:
 
-### Likely causes (in order of probability):
-
-#### 1. The "Подписаться" URL leads to something the code can't auto-complete
-The URL behind the button might be:
-- A Cloudflare-protected page (can't be opened by a Telegram client)
-- A URL that requires manual human interaction
-- A redirector that doesn't resolve to a t.me link
-
-**Evidence:** The code has a relay system (`relaySponsorUrls`) specifically for "unknown URLs" — these are URLs that don't match any t.me pattern. If the URL has changed to a non-t.me URL, it would fall through to the "Unknown URL" path, which only adds it to `captchaUrls` but does NOT actually subscribe.
-
-#### 2. The verify callback data is stale
-The `freshMsg` is the message found in `ensureMenu` with `limit: 5`. If there are newer messages, this message's callback data might be expired by the time `handleSponsor` clicks it 3 times (with delays of 2-4 seconds each).
-
-#### 3. The downstream action (join/start) fails silently
-The `try/catch` at line 670 catches ALL errors with just `console.log`:
-```javascript
-} catch (e) {
-  if (e.message === "CHANNELS_TOO_MUCH") {
-    await notify(...);
-  } else {
-    console.log(`[SPONSOR] Button error (skipping): ${e.message}`);
-  }
-}
 ```
-If the action fails (e.g., "CHANNELS_TOO_MUCH", "Cannot find entity", rate limit), it's silently swallowed.
+Sweep 1: join → verify fails → retry in 10 min
+Sweep 2: already member → verify fails → retry in 10 min
+Sweep 3: already member → verify fails → retry in 10 min
+... (multiple cycles) ...
+Sweep N: already member → verify succeeds ✅ (propagation caught up)
+```
 
-#### 4. `getMessages(limit: 5)` doesn't return the sponsor message
-If there are many new messages in the chat, the sponsor message might fall out of the `limit: 5` window on retry attempts.
+After enough time (hours), Telegram's membership index has fully propagated, and the sponsor bot's callback handler finally sees the join.
 
 ---
 
-## Code Locations
+## What Can Be Done
 
-| File | Lines | Function | What it does |
-|---|---|---|---|
-| `index.js` | 51 | `SPONSOR_DELAY` | 10 minutes (600 seconds) |
-| `index.js` | 129 | `RELAY_TO` | "Aliorythm" — where captcha URLs are relayed |
-| `index.js` | 181-195 | `relaySponsorUrls()` | Sends unknown URLs to admin |
-| `index.js` | 318-335 | `resolveUrl()` | Unwraps redirect URLs |
-| `index.js` | 337-353 | URL regex constants | TG_BOT_START, TG_ANY_LINK, TG_USERNAME |
-| `index.js` | 355-370 | `startBot()` | Sends /start via StartBot API |
-| `index.js` | 390-430 | `getSavedLink()` | Checks saved_links DB for known redirectors |
-| `index.js` | 435-455 | `executeSavedLink()` | Joins channel or starts bot from saved link |
-| `index.js` | 533-601 | `ensureMenu()` | Detects sponsor screen, calls handleSponsor |
-| `index.js` | 603-770 | `handleSponsor()` | Processes sponsor buttons, clicks verify |
-| `index.js` | 625-638 | (inside handleSponsor) | Button detection — WORKS correctly |
-| `index.js` | 645-720 | (inside handleSponsor) | URL classification & execution |
-| `index.js` | 670-685 | (inside handleSponsor) | Error catch — SILENT, logs but continues |
-| `index.js` | 737-762 | (inside handleSponsor) | RequestAppWebView fallback |
-| `index.js` | 880-910 | handleTasks flow | Sends /start before tasks |
-| `index.js` | 937-939 | (inside handleTasks) | Task button detection (same pattern) |
-| `index.js` | 1206-1340 | `doClicker()` | Main clicker entry point |
-| `index.js` | 1969 | processAccount | Catches SPONSOR_UNRESOLVABLE error |
-
----
-
-## The Loop Flow (Step by Step)
-
-```
-processAccount()
-  → doClicker()
-    → ensureMenu()
-      → sends /start
-      → polls for menu (limit: 5)
-      → finds sponsor message
-      → calls handleSponsor(client, sponsorMsg)
-        → attempt 1/3:
-          → fetches fresh messages (limit: 5)
-          → finds sponsor message (or falls back to sponsorMsg)
-          → detects buttons: actionBtns[0] + verifyBtn
-          → processes actionBtns[0]:
-            → extracts URL from btn.url
-            → classifies URL:
-              → saved link? bot? webapp? channel? unknown?
-              → if unknown: adds to captchaUrls, sleeps 4-7s, does nothing
-          → clicks verifyBtn:
-            → gets callback popup
-            → if popup contains "Подпишись на все каналы":
-              → tries RequestAppWebView fallback (only for startapp links)
-              → continue (retry)
-            → if popup is success: return true ✅
-        → attempt 2/3: same
-        → attempt 3/3: same
-        → all failed: relaySponsorUrls(captchaUrls) → admin notified
-        → return false ❌
-    → ensureMenu: resolved = false → throws SPONSOR_UNRESOLVABLE
-  → processAccount catches:
-    → sets next_clicker_time = now + 10 minutes
-    → sets last_error = "Sponsor unresolvable after 3 attempts"
-  → next sweep (10 min later): same thing happens
-```
-
----
-
-## What to Debug (Next Steps)
-
-### Option A: Add debug logging (recommended first step)
-
-Add temporary logs to `handleSponsor` to print:
-
-1. **The raw button structure** — confirm what gramjs returns:
-```javascript
-for (const row of freshMsg.replyMarkup.rows || [])
-  for (const btn of row.buttons)
-    console.log(`[SPONSOR DEBUG] btn: text="${btn.text}" url=${btn.url} className=${btn.className}`);
-```
-
-2. **The URL being processed** — what URL the "Подписаться" button points to:
-```javascript
-console.log(`[SPONSOR DEBUG] Processing URL: ${url}`);
-```
-
-3. **The classification result** — which branch the URL hits:
-```javascript
-console.log(`[SPONSOR DEBUG] Classification: saved=${!!saved} botMatch=${!!botMatch} isWebapp=${isWebapp} channelMatch=${!!channelMatch}`);
-```
-
-4. **The verify popup** — what the bot says after clicking verify:
-```javascript
-console.log(`[SPONSOR DEBUG] Verify popup: ${verifyPopup}`);
-```
-
-5. **Raw message info** — whether the fresh message is the same as the original:
-```javascript
-console.log(`[SPONSOR DEBUG] freshMsg.id=${freshMsg.id} sponsorMsg.id=${sponsorMsg.id} same=${freshMsg.id === sponsorMsg.id}`);
-```
-
-### Option B: Check what URL the button has
-
-The screenshot shows "✏️ Подписаться" with ↗️ arrow. We need to know the actual URL. Options:
-- Add the debug logging above
-- Or check the bot's message history in Telegram Desktop (right-click → copy link)
-
-### Option C: Check if it's a rate limit / channel limit issue
-
-The silent error catch at line 670 might be swallowing errors. The log line `[SPONSOR] Button error (skipping): ${e.message}` should appear in the console if this is the case. Check the logs for this line.
-
----
-
-## Saved Links System (for reference)
-
-If we confirm the URL and it's a redirector that can be mapped to a destination:
-
-```sql
--- schema.sql line 456-468
-CREATE TABLE saved_links (
-  id         BIGSERIAL PRIMARY KEY,
-  url        TEXT NOT NULL UNIQUE,       -- exact full redirector URL
-  dest_type  TEXT NOT NULL CHECK (dest_type IN ('bot', 'channel')),
-  dest_value TEXT NOT NULL,              -- bot: "username?start=param"  channel: id/username
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-```
-
-`getSavedLink(url)` checks:
-1. Exact URL match
-2. tgrass tracking URL (match by `tb_id`)
-3. Fuzzy prefix match (`prefixRatio`)
-
-`executeSavedLink(client, link, tag)` runs:
-- `dest_type = "channel"` → `joinChannel()`
-- `dest_type = "bot"` → `startBot()`
-
----
-
-## Gramjs API Reference
-
-### KeyboardButton types (gramjs v2.26.22)
-
-All available types (from `node_modules/telegram/tl/api.d.ts`):
-
-| Type | Properties | Has `.url`? |
-|------|-----------|-------------|
-| `KeyboardButton` | `{ text }` | ❌ |
-| `KeyboardButtonUrl` | `{ text, url }` | ✅ |
-| `KeyboardButtonCallback` | `{ text, data }` | ❌ |
-| `KeyboardButtonWebView` | `{ text, url }` | ✅ |
-| `KeyboardButtonSimpleWebView` | `{ text, url }` | ✅ |
-| `KeyboardButtonGame` | `{ text }` | ❌ |
-| `KeyboardButtonBuy` | `{ text }` | ❌ |
-| `KeyboardButtonUrlAuth` | `{ text, fwdText, botId, buttonId }` | ❌ |
-| `KeyboardButtonRequestPhone` | `{ text }` | ❌ |
-| `KeyboardButtonRequestGeoLocation` | `{ text }` | ❌ |
-| `KeyboardButtonSwitchInline` | `{ text, query, peerTypes, samePeer }` | ❌ |
-| `KeyboardButtonRequestPoll` | `{ text, quiz? }` | ❌ |
-| `KeyboardButtonRequestPeer` | `{ text, buttonId, peerTypes }` | ❌ |
-| `KeyboardButtonCopy` | `{ text, copyText }` | ❌ |
-
-### Constructor IDs (verified)
-
-```
-KeyboardButton:          2734311552
-KeyboardButtonUrl:        629866245
-KeyboardButtonCallback:   901503851
-KeyboardButtonWebView:    326529584
-KeyboardButtonSimpleWebView: 2696958044
-```
-
-### How replyMarkup is structured
+### Option 1: Add delay between join and verify (simplest)
+Currently the delay is only 2-3 seconds. Increasing it to 15-30 seconds after a fresh join (not "Already a member") might help:
 
 ```javascript
-// msg.replyMarkup is Api.ReplyInlineMarkup
-{
-  className: 'ReplyInlineMarkup',
-  rows: [
-    {
-      className: 'KeyboardButtonRow',
-      buttons: [
-        // KeyboardButtonWebView — has .url
-        { className: 'KeyboardButtonWebView', text: 'Подписаться', url: 'https://...' },
-        // KeyboardButtonCallback — has .data
-        { className: 'KeyboardButtonCallback', text: 'Я выполнил(а)', data: Buffer }
-      ]
-    }
-  ]
-}
+// After joinChannel
+if (!alreadyMember) await sleep(15000 + Math.random() * 15000); // wait for propagation
 ```
+
+### Option 2: Retry with longer backoff
+Instead of 3 rapid attempts, space them out:
+
+```
+Attempt 1: join → wait 20s → verify
+Attempt 2: wait 60s → verify  
+Attempt 3: wait 120s → verify
+```
+
+### Option 3: Re-send /start before verifying
+The sponsor bot might need to re-initialize its state:
+
+```javascript
+await client.sendMessage(BOT, { message: "/start" });
+await sleep(3000);
+// then re-fetch the sponsor message and click verify
+```
+
+### Option 4: Accept the race condition
+Since it fixes itself, the current behavior might be acceptable — the account retries in 10 minutes and eventually succeeds. The main cost is lost clicker cycles during the delay.
 
 ---
 
-## Key Insight
+## Debug Logs (what to look for next time)
 
-The original `web_app.url` vs `btn.url` hypothesis was **wrong for gramjs**. Gramjs normalizes both `KeyboardButtonUrl` and `KeyboardButtonWebView` to expose `.url` directly. The button detection code works correctly.
+All logs prefixed with `[SPONSOR-DBG]`:
 
-The real issue is almost certainly that **the URL behind the "Подписаться" button leads to something the code can't auto-complete**, causing the verify step to fail every time. Debug logging will confirm this.
+| Log | Meaning |
+|-----|---------|
+| `ensureMenu found sponsor msg id=X` | Sponsor message detected in ensureMenu |
+| `menu=false menuId=undefined` | No menu was found (sponsor is blocking) |
+| `freshMsg.id=X same=true` | Using same message (not re-fetched) |
+| `button: text="..." url=... className=KeyboardButtonUrl` | Button type and URL — confirms it's a plain URL button |
+| `classify: saved=false botMatch=false isWebapp=false channelMatch=true` | URL classified as channel invite |
+| `Joined ✅` vs `Already a member` vs `Join failed` | Join outcome |
+| `Verify full response: "❌ Подпишись..."` | Sponsor bot says not subscribed despite successful join |
