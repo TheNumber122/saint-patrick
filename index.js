@@ -564,6 +564,8 @@ async function ensureMenu(client, { skipSponsor = false } = {}) {
   );
   if (sponsorMsg) {
     if (skipSponsor) throw new Error("SPONSOR_GATED");
+    console.log(`[SPONSOR-DBG] ensureMenu found sponsor msg id=${sponsorMsg.id} text="${sponsorMsg.text?.substring(0, 80)}"`);
+    console.log(`[SPONSOR-DBG] ensureMenu: menu=${!!menu} menuId=${menu?.id}`);
     console.log(`[SPONSOR] Blocking screen — resolving...`);
     const resolved = await handleSponsor(client, sponsorMsg);
     if (!resolved) throw new Error("SPONSOR_UNRESOLVABLE");
@@ -622,6 +624,9 @@ async function handleSponsor(client, sponsorMsg) {
           m.replyMarkup,
       ) || sponsorMsg;
 
+    console.log(`[SPONSOR-DBG] freshMsg.id=${freshMsg.id} sponsorMsg.id=${sponsorMsg.id} same=${freshMsg.id === sponsorMsg.id}`);
+    console.log(`[SPONSOR-DBG] freshMsg.text snippet: ${freshMsg.text?.substring(0, 100)}`);
+
     if (!freshMsg?.replyMarkup?.rows) {
       console.log("[SPONSOR] No buttons");
       return false;
@@ -632,6 +637,7 @@ async function handleSponsor(client, sponsorMsg) {
     for (const row of freshMsg.replyMarkup.rows)
       for (const btn of row.buttons) {
         const t = btn.text || "";
+        console.log(`[SPONSOR-DBG] button: text="${t}" url=${btn.url || "(none)"} className=${btn.className} hasData=${!!btn.data}`);
         if (t.includes("Я выполнил") || t.includes("Проверить"))
           verifyBtn = btn;
         else if (btn.url) actionBtns.push(btn);
@@ -658,6 +664,7 @@ async function handleSponsor(client, sponsorMsg) {
         const channelMatch = !botMatch && !isWebapp && url.match(TG_ANY_LINK);
         // URL saved in the dashboard → execute its bot/channel destination.
         const saved = await getSavedLink(url);
+        console.log(`[SPONSOR-DBG] classify: saved=${!!saved} botMatch=${!!botMatch} isWebapp=${isWebapp} channelMatch=${!!channelMatch} isBot=${isBotUsername(username)} username=${username || "(none)"}`);
 
         if (saved) {
           await withCaptcha(client, async () => {
@@ -730,9 +737,12 @@ async function handleSponsor(client, sponsorMsg) {
       freshMsg,
       verifyBtn.data,
     );
+    console.log(`[SPONSOR-DBG] Verify full response: ${JSON.stringify(verifyPopup)}`);
     console.log(`[SPONSOR] Verify: ${verifyPopup || "none"}`);
 
     if (verifyPopup?.includes("Подпишись на все каналы")) {
+      console.log(`[SPONSOR-DBG] Verify says not done. actionBtns.length=${actionBtns.length}`);
+      for (const b of actionBtns) console.log(`[SPONSOR-DBG] fallback actionBtn: url=${b.url}`);
       console.log(`[SPONSOR] Not all done — RequestAppWebView fallback`);
       for (const btn of actionBtns) {
         const burl = resolveUrl(btn.url || "");
